@@ -1,0 +1,651 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["huggingface_hub>=1.32"]
+# ///
+"""hffinish: finish Hugging Face cache downloads and move complete models out.
+
+For every model in the Hugging Face hub cache (default ~/.cache/huggingface/hub):
+
+  1. compare the cached snapshot with the repo's file tree at that commit
+     (every file present with the right size; --checksum also hashes them),
+  2. if anything is missing, re-run the download: through `hfq` when it is on
+     PATH (so it queues behind other downloads), otherwise `hf download`.
+     huggingface_hub skips files that are already complete and restarts the
+     rest; it never resumes a half-written file, so stale `*.incomplete`
+     leftovers are deleted first,
+  3. once the snapshot is complete, move the files out of the cache into
+     ~/models/<name> as plain files (renames on the same filesystem, no
+     copies) and drop the cache entry.
+
+A repo that another process is downloading right now is left alone; pass
+--wait to wait for it and move it when the download ends.
+
+Usage:
+  hffinish                      full pass: check, resume, move
+  hffinish --dry-run            report only, change nothing
+  hffinish --wait               also wait for downloads that are in flight
+  hffinish org/name [...]       only these repos (substring match)
+  hffinish --no-move            check + resume, leave everything in the cache
+  hffinish --no-download        only move what is already complete
+  hffinish --merge              allow moving into an existing non-empty folder
+  hffinish --checksum           hash every file against the Hub first (slow)
+
+Runs with uv (`uv run --script`); without uv, run it with any Python that has
+huggingface_hub>=1.32, e.g. ~/.hf-cli/venv/bin/python hffinish.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from huggingface_hub import HfApi, constants
+from huggingface_hub.hf_api import RepoFile
+
+DEFAULT_DEST = Path.home() / "models"
+ACTIVE_WINDOW_S = 120  # a partial file written this recently counts as "download in progress"
+STAGING_PREFIX = ".hffinish-partial."
+STORE_SIDE_SUFFIXES = (".refs", ".lock")  # companions of a shared-store blob
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def human(n: float) -> str:
+    x = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if x < 1024 or unit == "TB":
+            return f"{x:.0f} {unit}" if unit == "B" else f"{x:.1f} {unit}"
+        x /= 1024
+    return f"{x:.1f} TB"
+
+
+def log(repo: "Repo | None", msg: str) -> None:
+    stamp = time.strftime("%H:%M:%S")
+    prefix = f"{stamp} [{repo.repo_id}] " if repo else f"{stamp} "
+    print(prefix + msg, flush=True)
+
+
+def link_chain(path: Path) -> list[Path]:
+    """[path, its link target, ...] ending at the first non-symlink (which may not exist)."""
+    chain = [path]
+    seen: set[Path] = set()
+    while os.path.islink(chain[-1]) and len(chain) < 32:
+        cur = chain[-1]
+        if cur in seen:
+            break
+        seen.add(cur)
+        target = Path(os.readlink(cur))
+        chain.append(target if target.is_absolute() else cur.parent / target)
+    return [Path(os.path.normpath(p)) for p in chain]
+
+
+def tool_env() -> dict[str, str]:
+    """Environment for child processes: PATH without this script's own uv environment,
+    so the user's hf (with hf_xet) and hfq are the ones that run."""
+    env = os.environ.copy()
+    own = os.path.normpath(os.path.join(sys.prefix, "bin"))
+    env["PATH"] = os.pathsep.join(
+        p for p in env.get("PATH", "").split(os.pathsep) if p and os.path.normpath(p) != own
+    )
+    return env
+
+
+def in_shared_store(real: Path, cache_dir: Path) -> bool:
+    try:
+        rel = real.relative_to(cache_dir / "blobs")
+    except ValueError:
+        return False
+    return len(rel.parts) == 2
+
+
+def remove_store_side_files(real: Path, cache_dir: Path) -> None:
+    """Drop the .refs manifest and .lock that huggingface_hub keeps next to a shared blob."""
+    if not in_shared_store(real, cache_dir):
+        return
+    for suffix in STORE_SIDE_SUFFIXES:
+        real.with_name(real.name + suffix).unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- cache layout
+
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+REPO_DIR_RE = re.compile(r"^(models|datasets|spaces|kernels)--(.+)$")
+
+
+@dataclass
+class Revision:
+    commit_hash: str
+    snapshot_path: Path
+    refs: frozenset[str]
+    last_modified: float
+
+
+@dataclass
+class CachedRepo:
+    repo_id: str
+    repo_type: str
+    repo_path: Path
+    revisions: list[Revision]
+
+
+def scan_cache(cache_dir: Path) -> list[CachedRepo]:
+    """Every <type>--<org>--<name> folder with its snapshots and refs.
+
+    Deliberately not huggingface_hub.scan_cache_dir(): that one drops a whole repo
+    from its listing as soon as one pointer dangles, which is exactly the kind of
+    repo this tool must see.
+    """
+    repos: list[CachedRepo] = []
+    for entry in sorted(cache_dir.iterdir()):
+        m = REPO_DIR_RE.match(entry.name)
+        if not m or not entry.is_dir():
+            continue
+        repo_type = m.group(1)[:-1]
+        repo_id = m.group(2).replace("--", "/")
+        ref_map: dict[str, set[str]] = {}
+        refs_dir = entry / "refs"
+        if refs_dir.is_dir():
+            for ref in refs_dir.rglob("*"):
+                if not ref.is_file():
+                    continue
+                try:
+                    commit = ref.read_text().strip()
+                except OSError:
+                    continue
+                ref_map.setdefault(commit, set()).add(ref.relative_to(refs_dir).as_posix())
+        revisions: list[Revision] = []
+        snapshots = entry / "snapshots"
+        if snapshots.is_dir():
+            for snap in snapshots.iterdir():
+                if not snap.is_dir():
+                    continue
+                if not COMMIT_RE.match(snap.name):
+                    log(None, f"warning: ignoring {snap} (name is not a commit hash)")
+                    continue
+                revisions.append(
+                    Revision(snap.name, snap, frozenset(ref_map.get(snap.name, ())), snap.stat().st_mtime)
+                )
+        repos.append(CachedRepo(repo_id, repo_type, entry, revisions))
+    return repos
+
+
+# --------------------------------------------------------------------------- model
+
+
+@dataclass
+class Repo:
+    info: CachedRepo
+    rev: Revision
+    tree: dict[str, int] = field(default_factory=dict)  # repo path -> size in bytes
+    missing: list[str] = field(default_factory=list)  # absent or dangling pointer
+    bad: list[str] = field(default_factory=list)  # present, wrong size or checksum
+    partials: list[Path] = field(default_factory=list)  # *.incomplete leftovers
+    status: str = ""
+    note: str = ""
+
+    @property
+    def repo_id(self) -> str:
+        return self.info.repo_id
+
+    @property
+    def commit(self) -> str:
+        return self.rev.commit_hash
+
+    @property
+    def snapshot(self) -> Path:
+        return self.rev.snapshot_path
+
+    def dest(self, root: Path, layout: str) -> Path:
+        return root / self.repo_id if layout == "nested" else root / self.repo_id.split("/")[-1]
+
+    def staging(self, root: Path, layout: str) -> Path:
+        d = self.dest(root, layout)
+        return d.parent / f"{STAGING_PREFIX}{d.name}"
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(self.tree.values())
+
+    @property
+    def partial_bytes(self) -> int:
+        total = 0
+        for p in self.partials:
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+        return total
+
+
+def pick_revision(info: CachedRepo) -> Revision | None:
+    revs = sorted(info.revisions, key=lambda r: r.last_modified, reverse=True)
+    for rev in revs:
+        if "main" in rev.refs:
+            return rev
+    return revs[0] if revs else None
+
+
+# --------------------------------------------------------------------------- inspection
+
+
+def load_tree(repo: Repo, api: HfApi) -> dict[str, int]:
+    """File list for the cached commit: from the on-disk tree cache, else from the Hub."""
+    path = repo.info.repo_path / "trees" / f"{repo.commit}.json"
+    try:
+        data = json.loads(path.read_text())
+        if data.get("format_version") == 1:
+            return {p: int(e["size"]) for p, e in data["files"].items()}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    tree: dict[str, int] = {}
+    for entry in api.list_repo_tree(
+        repo.repo_id, recursive=True, revision=repo.commit, repo_type=repo.info.repo_type
+    ):
+        if isinstance(entry, RepoFile):
+            tree[entry.path] = int(entry.size)
+    return tree
+
+
+def check(repo: Repo, staging: Path) -> None:
+    repo.missing.clear()
+    repo.bad.clear()
+    for rel, size in repo.tree.items():
+        p = repo.snapshot / rel
+        if os.path.isfile(p):  # follows the symlink chain
+            if os.path.getsize(p) != size:
+                repo.bad.append(rel)
+        elif os.path.isfile(staging / rel) and os.path.getsize(staging / rel) == size:
+            continue  # already moved out by an interrupted run
+        else:
+            repo.missing.append(rel)
+    repo.partials = sorted((repo.info.repo_path / "blobs").glob("*.incomplete"))
+
+
+def checksum(repo: Repo, api: HfApi, cache_dir: Path) -> None:
+    result = api.verify_repo_checksums(
+        repo.repo_id, repo_type=repo.info.repo_type, revision=repo.commit, cache_dir=str(cache_dir)
+    )
+    for m in result.mismatches:
+        if m["path"] not in repo.bad:
+            repo.bad.append(m["path"])
+    for p in result.missing_paths:
+        if p not in repo.missing:
+            repo.missing.append(p)
+
+
+def active_reason(repo: Repo, cache_dir: Path) -> str | None:
+    """Why this repo must not be touched right now, or None."""
+    # 1. some process has the repo id on its command line (hf download, hfq, ...)
+    mine = {os.getpid(), os.getppid()}
+    want = repo.repo_id.lower()
+    for proc in Path("/proc").glob("[0-9]*"):
+        if int(proc.name) in mine:
+            continue
+        try:
+            argv = [a.decode(errors="replace") for a in (proc / "cmdline").read_bytes().split(b"\0") if a]
+        except OSError:
+            continue
+        if any("hffinish" in a for a in argv):
+            continue
+        if any(a.lower() == want for a in argv):
+            shown = " ".join(os.path.basename(a) if a.startswith("/") else a for a in argv)
+            return f"pid {proc.name}: {shown[:70]}"
+    # 2. a per-file download lock is held
+    for lock in (cache_dir / ".locks" / repo.info.repo_path.name).glob("*.lock"):
+        try:
+            fd = os.open(lock, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return f"download lock held ({lock.name[:10]}...)"
+        finally:
+            os.close(fd)
+    # 3. a partial file was written moments ago
+    now = time.time()
+    for part in (repo.info.repo_path / "blobs").glob("*.incomplete"):
+        try:
+            age = now - part.stat().st_mtime
+        except OSError:
+            continue
+        if age < ACTIVE_WINDOW_S:
+            return f"partial file written {int(age)}s ago"
+    return None
+
+
+def build_refcounts(repos: list[CachedRepo]) -> dict[Path, int]:
+    """How many snapshot files (across the whole cache) resolve to each real blob."""
+    counts: dict[Path, int] = {}
+    for info in repos:
+        for rev in info.revisions:
+            for root, _dirs, files in os.walk(rev.snapshot_path):
+                for fn in files:
+                    real = link_chain(Path(root) / fn)[-1]
+                    counts[real] = counts.get(real, 0) + 1
+    return counts
+
+
+# --------------------------------------------------------------------------- actions
+
+
+def resume(repo: Repo, args: argparse.Namespace, cache_dir: Path) -> int:
+    blobs = repo.info.repo_path / "blobs"
+    for rel in repo.bad:  # a wrong-sized blob would be trusted by the downloader: drop it
+        chain = link_chain(repo.snapshot / rel)
+        for p in chain:
+            try:
+                if p.is_symlink() or p.is_file():
+                    p.unlink()
+            except OSError as exc:
+                log(repo, f"warning: could not remove {p}: {exc}")
+        remove_store_side_files(chain[-1], cache_dir)
+        log(repo, f"dropped corrupt file {rel}")
+    for rel in repo.missing:
+        p = repo.snapshot / rel
+        if p.is_symlink() and not p.exists():
+            p.unlink()
+    if repo.partials:
+        freed = repo.partial_bytes
+        for part in repo.partials:
+            try:
+                part.unlink()
+            except OSError as exc:
+                log(repo, f"warning: could not remove {part.name}: {exc}")
+        log(repo, f"removed {len(repo.partials)} stale partial file(s), {human(freed)} freed")
+        repo.partials = []
+
+    hf_opts = ["--revision", repo.commit]
+    if cache_dir != Path(constants.HF_HUB_CACHE):
+        hf_opts += ["--cache-dir", str(cache_dir)]
+    if repo.info.repo_type != "model":
+        hf_opts += ["--type", repo.info.repo_type]
+    env = tool_env()
+    hfq = None if args.no_queue else shutil.which("hfq", path=env["PATH"])
+    hf = shutil.which("hf", path=env["PATH"]) or shutil.which("hf")
+    if hfq:
+        cmd = [hfq, repo.repo_id, "--", *hf_opts]
+    elif hf:
+        cmd = [hf, "download", repo.repo_id, *hf_opts]
+    else:
+        log(repo, "neither hfq nor hf on PATH, downloading in-process")
+        from huggingface_hub import snapshot_download
+
+        try:
+            snapshot_download(
+                repo.repo_id, revision=repo.commit, repo_type=repo.info.repo_type, cache_dir=str(cache_dir)
+            )
+            return 0
+        except Exception as exc:  # noqa: BLE001 - report and carry on with the next repo
+            log(repo, f"download failed: {exc}")
+            return 1
+    log(repo, "running: " + " ".join(cmd))
+    return subprocess.call(cmd, env=env)
+
+
+def move(repo: Repo, args: argparse.Namespace, refcount: dict[Path, int], cache_dir: Path) -> Path | None:
+    dest = repo.dest(args.dest, args.layout)
+    staging = repo.staging(args.dest, args.layout)
+
+    if dest.exists() and not dest.is_dir():
+        repo.status, repo.note = "skipped", f"{dest} exists and is not a directory"
+        return None
+    if dest.is_dir() and any(dest.iterdir()) and not args.merge:
+        repo.status, repo.note = "skipped", f"{dest} already exists (use --merge to move files into it)"
+        return None
+
+    # plan: rename when this snapshot is the blob's only user, copy when it is shared
+    plan: list[tuple[Path, Path, list[Path], bool]] = []  # (src pointer, staged path, chain, copy?)
+    copy_bytes = 0
+    for root, _dirs, files in os.walk(repo.snapshot):
+        for fn in files:
+            src = Path(root) / fn
+            chain = link_chain(src)
+            real = chain[-1]
+            staged = staging / src.relative_to(repo.snapshot)
+            if staged.exists() and not real.exists():
+                continue  # moved by an interrupted run
+            shared = refcount.get(real, 1) > 1
+            if shared:
+                try:
+                    copy_bytes += real.stat().st_size
+                except OSError:
+                    pass
+            plan.append((src, staged, chain, shared))
+
+    n_copy = sum(1 for p in plan if p[3])
+    how = f"{len(plan)} file(s), {human(repo.total_bytes)}"
+    if n_copy:
+        how += f", {n_copy} shared blob(s) copied ({human(copy_bytes)})"
+    if args.dry_run:
+        log(repo, f"would move {how} -> {dest}")
+        repo.status, repo.note = "ready", f"would move to {dest}"
+        return dest
+
+    if copy_bytes:
+        free = shutil.disk_usage(dest.parent).free
+        if copy_bytes > free:
+            repo.status, repo.note = "error", f"need {human(copy_bytes)} free at {dest.parent}, have {human(free)}"
+            return None
+
+    log(repo, f"moving {how} -> {dest}")
+    staging.mkdir(parents=True, exist_ok=True)
+    for _src, staged, chain, shared in plan:
+        real = chain[-1]
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if shared:
+            shutil.copy2(real, staged)
+            refcount[real] = refcount.get(real, 1) - 1
+            continue
+        try:
+            os.rename(real, staged)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            shutil.copy2(real, staged)  # other filesystem: copy, then free the cache copy
+            real.unlink()
+        refcount.pop(real, None)
+        for link in chain[1:-1]:  # per-repo blobs/<etag> symlink now dangles
+            link.unlink(missing_ok=True)
+        remove_store_side_files(real, cache_dir)
+
+    wrong = [
+        rel
+        for rel, size in repo.tree.items()
+        if not (staging / rel).is_file() or (staging / rel).stat().st_size != size
+    ]
+    if wrong:
+        repo.status, repo.note = "error", f"{len(wrong)} file(s) wrong after move, left in {staging}"
+        return None
+
+    # the cache no longer holds this revision
+    shutil.rmtree(repo.snapshot, ignore_errors=True)
+    refs_dir = repo.info.repo_path / "refs"
+    for ref in refs_dir.rglob("*"):
+        try:
+            if ref.is_file() and ref.read_text().strip() == repo.commit:
+                ref.unlink()
+        except OSError:
+            pass
+    (repo.info.repo_path / "trees" / f"{repo.commit}.json").unlink(missing_ok=True)
+    snapshots = repo.info.repo_path / "snapshots"
+    leftover = [p for p in snapshots.iterdir()] if snapshots.is_dir() else []
+    if leftover:
+        log(repo, f"{len(leftover)} other revision(s) stay in the cache (hf cache prune drops detached ones)")
+    else:
+        shutil.rmtree(repo.info.repo_path, ignore_errors=True)
+        shutil.rmtree(cache_dir / ".locks" / repo.info.repo_path.name, ignore_errors=True)
+
+    if dest.is_dir():
+        if any(dest.iterdir()):
+            for root, _dirs, files in os.walk(staging):
+                for fn in files:
+                    s = Path(root) / fn
+                    d = dest / s.relative_to(staging)
+                    d.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(s, d)
+            shutil.rmtree(staging, ignore_errors=True)
+        else:
+            dest.rmdir()
+            staging.rename(dest)
+    else:
+        staging.rename(dest)
+    repo.status, repo.note = "moved", str(dest)
+    log(repo, f"moved to {dest}")
+    return dest
+
+
+def process(repo: Repo, args: argparse.Namespace, api: HfApi, refcount: dict[Path, int], cache_dir: Path) -> None:
+    try:
+        repo.tree = load_tree(repo, api)
+    except Exception as exc:  # noqa: BLE001 - network or auth trouble, report and move on
+        repo.status, repo.note = "error", f"could not get the file tree: {exc}"
+        log(repo, repo.note)
+        return
+    staging = repo.staging(args.dest, args.layout)
+    check(repo, staging)
+    if args.checksum and not repo.missing and not repo.bad:
+        log(repo, "hashing every file against the Hub...")
+        try:
+            checksum(repo, api, cache_dir)
+        except Exception as exc:  # noqa: BLE001
+            repo.status, repo.note = "error", f"checksum failed: {exc}"
+            log(repo, repo.note)
+            return
+
+    if repo.missing or repo.bad:
+        need = sum(repo.tree[r] for r in repo.missing + repo.bad)
+        detail = (
+            f"incomplete: {len(repo.missing)} missing, {len(repo.bad)} bad of {len(repo.tree)} files "
+            f"({human(need)} of {human(repo.total_bytes)} still to fetch)"
+        )
+        if repo.partials:
+            detail += f", {len(repo.partials)} stale partial(s) {human(repo.partial_bytes)}"
+        log(repo, detail)
+        if args.no_download or args.dry_run:
+            repo.status, repo.note = "incomplete", f"{len(repo.missing) + len(repo.bad)} file(s) to fetch"
+            return
+        rc = resume(repo, args, cache_dir)
+        check(repo, staging)
+        if repo.missing or repo.bad:
+            left = len(repo.missing) + len(repo.bad)
+            repo.status, repo.note = "incomplete", f"{left} file(s) still missing after download (exit {rc})"
+            log(repo, repo.note)
+            return
+        log(repo, "download complete")
+    else:
+        log(repo, f"complete: {len(repo.tree)} files, {human(repo.total_bytes)}")
+
+    if args.no_move:
+        repo.status, repo.note = "complete", "left in cache (--no-move)"
+        return
+    move(repo, args, refcount, cache_dir)
+
+
+# --------------------------------------------------------------------------- main
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        prog="hffinish",
+        description="Finish incomplete Hugging Face cache downloads and move complete models out of the cache.",
+    )
+    ap.add_argument("repos", nargs="*", help="only repos whose id contains one of these strings")
+    ap.add_argument("--cache-dir", help=f"hub cache to scan (default {constants.HF_HUB_CACHE})")
+    ap.add_argument("--dest", type=Path, default=DEFAULT_DEST, help=f"where models go (default {DEFAULT_DEST})")
+    ap.add_argument("--layout", choices=("flat", "nested"), default="flat", help="<name> (default) or <org>/<name>")
+    ap.add_argument("--dry-run", action="store_true", help="report only, change nothing")
+    ap.add_argument("--no-download", action="store_true", help="do not resume anything, only move complete repos")
+    ap.add_argument("--no-move", action="store_true", help="do not move anything, only check and resume")
+    ap.add_argument("--no-queue", action="store_true", help="call hf download directly instead of hfq")
+    ap.add_argument("--wait", action="store_true", help="wait for downloads other processes are running")
+    ap.add_argument("--poll", type=int, default=30, help="seconds between checks with --wait (default 30)")
+    ap.add_argument("--merge", action="store_true", help="move files into a destination folder that already exists")
+    ap.add_argument("--checksum", action="store_true", help="verify every file's hash against the Hub before moving")
+    return ap.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    cache_dir = Path(args.cache_dir or constants.HF_HUB_CACHE).expanduser().resolve()
+    if not cache_dir.is_dir():
+        print(f"hffinish: cache dir not found: {cache_dir}", file=sys.stderr)
+        return 2
+    args.dest = args.dest.expanduser()
+    if not args.dry_run and not args.no_move:
+        args.dest.mkdir(parents=True, exist_ok=True)
+
+    cached = scan_cache(cache_dir)
+    repos: list[Repo] = []
+    for info in sorted(cached, key=lambda r: r.repo_id.lower()):
+        if args.repos and not any(sel.lower() in info.repo_id.lower() for sel in args.repos):
+            continue
+        if info.repo_type != "model":
+            log(None, f"[{info.repo_id}] skipped: {info.repo_type} repos are not moved")
+            continue
+        rev = pick_revision(info)
+        if rev is None:
+            continue
+        repos.append(Repo(info, rev))
+    if not repos:
+        log(None, f"no cached models in {cache_dir}" + (" matching the filter" if args.repos else ""))
+        return 0
+
+    log(None, f"cache {cache_dir} -> {args.dest}: {len(repos)} model(s)" + (" (dry run)" if args.dry_run else ""))
+    api = HfApi()
+    refcount = build_refcounts(cached)
+    announced: set[str] = set()
+    todo = repos
+    try:
+        while todo:
+            deferred: list[Repo] = []
+            for repo in todo:
+                reason = active_reason(repo, cache_dir)
+                if reason:
+                    if args.wait:
+                        if repo.repo_id not in announced:
+                            log(repo, f"being downloaded by another process ({reason}), waiting")
+                            announced.add(repo.repo_id)
+                        deferred.append(repo)
+                    else:
+                        repo.status, repo.note = "downloading", reason
+                        log(repo, f"being downloaded by another process ({reason}), left alone")
+                    continue
+                process(repo, args, api, refcount, cache_dir)
+            if not deferred:
+                break
+            time.sleep(args.poll)
+            todo = deferred
+    except KeyboardInterrupt:
+        print("\nhffinish: interrupted", file=sys.stderr)
+        for repo in repos:
+            if not repo.status:
+                repo.status, repo.note = "interrupted", ""
+        summary(repos)
+        return 130
+
+    summary(repos)
+    return 0 if all(r.status in ("moved", "complete", "ready") for r in repos) else 1
+
+
+def summary(repos: list[Repo]) -> None:
+    width = max(len(r.repo_id) for r in repos)
+    print("\nSTATUS       REPO" + " " * (width - 3) + "NOTE")
+    for repo in repos:
+        print(f"{repo.status:<12} {repo.repo_id:<{width}} {repo.note}")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
