@@ -623,8 +623,10 @@ def hash_tree(root: Path, files: list[FileCheck], stage: str, w: "Worker", repo_
         setattr(f, stage, digest)
         done_total += f.size
         mark_ok = f.stage_ok(stage)
-        tick = "OK" if mark_ok else ("??" if mark_ok is None else "MISMATCH")
-        w.line.emit(f"{f.algo} {f.path}: hub={f.expected[:16] or '-'}  {stage.replace('_', ' ')}={digest[:16]}  {tick}")
+        tick = "OK, match" if mark_ok else ("no expected value" if mark_ok is None else "MISMATCH")
+        w.line.emit(
+            f"  {stage.replace('_', ' ')} {f.algo} {f.path}: expected {f.expected or '-'}  received {digest}  -> {tick}"
+        )
         if mark_ok is False:
             bad.append(f)
     w.progress.emit("")
@@ -1161,7 +1163,7 @@ def download_job(repo_id: str, revision: str, opts: Options, finish_after: bool,
                 f"{report.commit[:12] or revision or 'main'}; checksums known for {known} (before download)"
             )
             for f in report.files:
-                w.line.emit(f"  expected {f.algo} {f.path}: {f.expected or '-'}")
+                w.line.emit(f"  expected {f.algo} {f.path}: {f.expected or '-'}  (received hash is logged next to it after the download)")
         except Exception as exc:  # noqa: BLE001 - offline, gated, typo
             report.notes["expected"] = f"could not get the file list: {type(exc).__name__}: {exc}"
             w.line.emit(f"{repo_id}: {report.notes['expected']}")
