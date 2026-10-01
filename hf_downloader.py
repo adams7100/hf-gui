@@ -42,7 +42,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImage
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -2783,6 +2783,7 @@ class MainWindow(QMainWindow):
         self.ext_bridge.transfer.connect(self._on_transfer)
         self.transfer_rows: dict[str, TransferRow] = {}
         self.checksum_dialogs: list[QDialog] = []  # open verification pop-ups
+        self.log_path = self._open_log_file()
         self._follow_repo = ""  # the model the open card window should switch to
         self._follow_timer = QTimer(self)
         self._follow_timer.setSingleShot(True)
@@ -2981,11 +2982,16 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self.stop)
         mark(self.stop_btn, "danger")
         self.clear_btn = QPushButton("Clear log")
+        self.clear_btn.setToolTip("Clears the log shown here; the log file keeps everything")
         self.clear_btn.clicked.connect(self.log_view_clear)
+        self.open_log_btn = QPushButton("Open log")
+        self.open_log_btn.setToolTip("Open the log file (every line of every session, including all checksums) in your editor")
+        self.open_log_btn.clicked.connect(self.open_log)
         buttons.addWidget(self.scan_btn)
         buttons.addWidget(self.run_btn)
         buttons.addWidget(self.stop_btn)
         buttons.addStretch(1)
+        buttons.addWidget(self.open_log_btn)
         buttons.addWidget(self.clear_btn)
         form.addRow(buttons)
         root.addWidget(fin)
@@ -3051,6 +3057,14 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act)
         act = QAction("Open hub &cache folder", self)
         act.triggered.connect(lambda: self._open_folder(str(self._options().cache_path())))
+        file_menu.addAction(act)
+        file_menu.addSeparator()
+        act = QAction("Open lo&g file", self)
+        act.setShortcut("Ctrl+L")
+        act.triggered.connect(self.open_log)
+        file_menu.addAction(act)
+        act = QAction("Open log f&older", self)
+        act.triggered.connect(lambda: self._open_folder(str(self.log_path.parent)))
         file_menu.addAction(act)
         file_menu.addSeparator()
         act = QAction("&Quit", self)
@@ -3749,10 +3763,47 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def append_line(self, line: str) -> None:
         self.log_view.appendPlainText(line)
+        if self._log_file is not None:
+            try:
+                self._log_file.write(line + "\n")
+                self._log_file.flush()
+            except OSError:
+                self._log_file = None
 
     @Slot()
     def log_view_clear(self) -> None:
         self.log_view.clear()
+
+    # -- the log file
+
+    def _open_log_file(self) -> Path:
+        """Every log line also goes to <app data>/hf-downloader.log (rotated at 20 MB)."""
+        folder = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation) or ".")
+        path = folder / "hf-downloader.log"
+        self._log_file = None
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            if path.is_file() and path.stat().st_size > 20 << 20:
+                path.replace(path.with_suffix(".log.1"))
+            self._log_file = open(path, "a", encoding="utf-8")  # noqa: SIM115 - kept open for the session
+            self._log_file.write(f"\n===== {APP_NAME} {APP_VERSION} started {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            self._log_file.flush()
+        except OSError:
+            self._log_file = None
+        return path
+
+    @Slot()
+    def open_log(self) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.flush()
+            except OSError:
+                pass
+        if not self.log_path.is_file():
+            QMessageBox.information(self, APP_NAME, f"No log file yet:\n{self.log_path}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_path))):
+            QMessageBox.information(self, APP_NAME, f"Could not open the log file; it is at:\n{self.log_path}")
 
     @Slot(list)
     def _on_repos_found(self, ids: list) -> None:
@@ -3848,6 +3899,13 @@ class MainWindow(QMainWindow):
         if self.card_dialog is not None:
             self.card_dialog.close()
         self._save_settings()
+        if self._log_file is not None:
+            try:
+                self._log_file.write(f"===== closed {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+                self._log_file.close()
+            except OSError:
+                pass
+            self._log_file = None
         event.accept()
 
 

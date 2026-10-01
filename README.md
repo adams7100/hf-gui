@@ -201,7 +201,11 @@ three tabs.
   size-only check. "Check (dry run)" verifies and reports, "Finish and move"
   resumes and moves. Every repo appears in the table with its status and
   size; the log below shows what the script prints. Stop ends the run after
-  the current step (it kills a running `hf download`).
+  the current step (it kills a running `hf download`). Every log line is
+  also written to `hf-downloader.log` in the app's local data folder
+  (`%LOCALAPPDATA%\HF-Downloader\HF-Downloader` on Windows), across sessions,
+  rotated at 20 MB; "Open log" (or File > Open log file, Ctrl+L) opens it in
+  your editor, "Clear log" only clears the view.
 
 **Browse Hub** tab: the Hub's model listing, fetched through the same API the
 website uses. Search words, author, task (pipeline tag) and tags filter it;
