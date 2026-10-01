@@ -271,6 +271,50 @@ def heartbeat_text(t: "Transfer") -> tuple[str, str]:
     return ("receiving data", "#1e8e3e")
 
 
+def kill_tree(proc: subprocess.Popen) -> None:
+    """End a download command and everything it spawned.
+
+    `hf.exe` is a launcher: the download itself runs in a Python child (and on
+    Windows often a grandchild). Ending only the launcher would leave that child
+    downloading in the background, so the whole tree goes.
+    """
+    if psutil is not None:
+        try:
+            parent = psutil.Process(proc.pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.terminate()
+                except psutil.Error:
+                    pass
+            parent.terminate()
+            _gone, alive = psutil.wait_procs([parent, *children], timeout=3)
+            for p in alive:
+                try:
+                    p.kill()
+                except psutil.Error:
+                    pass
+            return
+        except psutil.Error:
+            pass
+    if WINDOWS:
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -490,6 +534,22 @@ class Options:
         return Path(self.dest or hff.DEFAULT_DEST).expanduser()
 
 
+@dataclass
+class QueueItem:
+    """A download waiting for a slot, or remembered across restarts."""
+
+    repo_id: str
+    revision: str = ""
+    mode: str = "download"  # "download": fetch it; "resume": pick a cached, unfinished one up
+
+    def as_dict(self) -> dict[str, str]:
+        return {"repo_id": self.repo_id, "revision": self.revision, "mode": self.mode}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "QueueItem":
+        return cls(str(d.get("repo_id", "")), str(d.get("revision", "")), str(d.get("mode", "download")))
+
+
 # --------------------------------------------------------------------------- worker
 
 
@@ -643,10 +703,7 @@ class Worker(QThread):
         with self._lock:
             proc = self._proc
         if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
+            kill_tree(proc)
 
     @property
     def cancelled(self) -> bool:
@@ -1058,8 +1115,12 @@ class LibraryTab(QWidget):
 
         root = QVBoxLayout(self)
         top = QHBoxLayout()
-        self.where = QLabel()
-        self.where.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.where = QLineEdit()
+        self.where.setPlaceholderText(str(hff.DEFAULT_DEST))
+        self.where.setToolTip("The library folder. Type a path and press Enter (or leave the field) to switch to it.")
+        self.where.editingFinished.connect(self._where_changed)
+        self.where_browse_btn = QPushButton("Browse...")
+        self.where_browse_btn.clicked.connect(self._browse_where)
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh)
         self.open_btn = QPushButton("Open library folder")
@@ -1075,6 +1136,7 @@ class LibraryTab(QWidget):
         mark(self.resume_btn, "primary")
         top.addWidget(QLabel("Library:"))
         top.addWidget(self.where, 1)
+        top.addWidget(self.where_browse_btn)
         top.addWidget(self.verify_btn)
         top.addWidget(self.resume_btn)
         top.addWidget(self.open_model_btn)
@@ -1105,11 +1167,27 @@ class LibraryTab(QWidget):
         self._selection_changed()
 
     @Slot()
+    def _where_changed(self) -> None:
+        """Typed a new library folder here: it becomes the library folder everywhere."""
+        text = self.where.text().strip()
+        if text != self.window.dest_edit.text().strip():
+            self.window.dest_edit.setText(text)
+            self.window._dest_changed()
+
+    def _browse_where(self) -> None:
+        start = self.where.text().strip() or str(self.window._options().dest_path())
+        chosen = QFileDialog.getExistingDirectory(self, "Choose the library folder", start)
+        if chosen:
+            self.where.setText(os.path.normpath(chosen))
+            self._where_changed()
+
+    @Slot()
     def refresh(self) -> None:
         if self.scanner is not None:
             return
         opts = self.window._options()
-        self.where.setText(str(opts.dest_path()))
+        if not self.where.hasFocus():
+            self.where.setText(opts.dest)  # empty means the default, shown as the placeholder
         self.refresh_btn.setEnabled(False)
         self.summary.setText("Scanning...")
         self.scanner = LibraryScanner(opts.dest_path(), opts.cache_path(), opts.layout, self)
@@ -2217,7 +2295,8 @@ class MainWindow(QMainWindow):
         self.resize(1040, 760)
         self.settings = QSettings(APP_NAME, APP_NAME)
         self.workers: list[Worker] = []  # jobs running right now
-        self.queue: list[tuple[str, str]] = []  # (repo id, revision) waiting for a download slot
+        self.queue: list[QueueItem] = []  # downloads waiting for a slot
+        self.interrupted: list[QueueItem] = []  # downloads that did not finish (this run or the last one)
         self.rows: dict[str, int] = {}
         self.card_dialog: ModelCardDialog | None = None
         self.ext_meters: dict[str, TransferMeter] = {}  # repo id -> watch on another process's download
@@ -2325,6 +2404,25 @@ class MainWindow(QMainWindow):
         list_row.addWidget(self.list_edit, 1)
         list_row.addLayout(list_btns)
         dl_box.addLayout(list_row)
+
+        # downloads that did not finish (last time or this time): one click resumes them all
+        self.resume_banner = QWidget()
+        banner = QHBoxLayout(self.resume_banner)
+        banner.setContentsMargins(0, 0, 0, 0)
+        self.resume_banner_label = QLabel()
+        self.resume_banner_label.setWordWrap(True)
+        self.resume_all_btn = QPushButton("Resume all")
+        self.resume_all_btn.setToolTip("Pick every unfinished download up where it stopped")
+        self.resume_all_btn.clicked.connect(self.resume_interrupted)
+        mark(self.resume_all_btn, "primary")
+        self.dismiss_btn = QPushButton("Forget them")
+        self.dismiss_btn.setToolTip("Stop remembering these; the files already in the cache stay there")
+        self.dismiss_btn.clicked.connect(self.dismiss_interrupted)
+        banner.addWidget(self.resume_banner_label, 1)
+        banner.addWidget(self.resume_all_btn)
+        banner.addWidget(self.dismiss_btn)
+        self.resume_banner.setVisible(False)
+        dl_box.addWidget(self.resume_banner)
         root.addWidget(dl)
 
         # finish cached models
@@ -2335,6 +2433,8 @@ class MainWindow(QMainWindow):
         form.addRow("Hub cache:", self._path_row(self.cache_edit, "Choose the Hugging Face hub cache"))
         self.dest_edit = QLineEdit()
         self.dest_edit.setPlaceholderText(str(hff.DEFAULT_DEST))
+        self.dest_edit.setToolTip("Type a folder or browse; it applies as soon as you leave the field")
+        self.dest_edit.editingFinished.connect(self._dest_changed)
         form.addRow("Library folder:", self._path_row(self.dest_edit, "Choose where models go"))
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("all models; or parts of repo ids, separated by spaces")
@@ -2500,6 +2600,12 @@ class MainWindow(QMainWindow):
         self.finish_after_cb.setChecked(s.value("finish_after", True, bool))
         self.list_edit.setPlainText(s.value("download_list", "", str))
         self.parallel_spin.setValue(s.value("parallel", 3, int))
+        try:
+            saved = json.loads(s.value("unfinished", "[]", str))
+        except ValueError:
+            saved = []
+        self.interrupted = [QueueItem.from_dict(d) for d in saved if isinstance(d, dict) and d.get("repo_id")]
+        self._update_banner()
         b = self.browse
         b.search_edit.setText(s.value("browse_search", "", str))
         b.author_edit.setText(s.value("browse_author", "", str))
@@ -2530,6 +2636,7 @@ class MainWindow(QMainWindow):
         s.setValue("finish_after", self.finish_after_cb.isChecked())
         s.setValue("download_list", self.list_edit.toPlainText())
         s.setValue("parallel", self.parallel_spin.value())
+        self._save_unfinished()
         b = self.browse
         s.setValue("browse_search", b.search_edit.text())
         s.setValue("browse_author", b.author_edit.text())
@@ -2615,13 +2722,13 @@ class MainWindow(QMainWindow):
     def active_repos(self) -> set[str]:
         """Repos being downloaded, verified or resumed right now, plus the queue."""
         active = {r for w in self.workers for r in w.repo_ids}
-        active.update(r for r, _rev in self.queue)
+        active.update(item.repo_id for item in self.queue)
         return active
 
     def _downloads_in_flight(self) -> int:
         return sum(1 for w in self.workers if w.ctx is not None and w.ctx[0] == "download")
 
-    def _enqueue(self, items: list[tuple[str, str]]) -> None:
+    def _enqueue(self, items: list[tuple[str, str]], mode: str = "download") -> None:
         if not self.workers and not self.queue:
             self._clear_results()
         active = self.active_repos()
@@ -2630,29 +2737,95 @@ class MainWindow(QMainWindow):
             if repo_id in active:
                 continue
             active.add(repo_id)
-            self.queue.append((repo_id, revision))
+            self.queue.append(QueueItem(repo_id, revision, mode))
+            self.interrupted = [it for it in self.interrupted if it.repo_id != repo_id]
             self._set_row(repo_id, "queued", "waiting for a download slot", None)
             added += 1
         if added > 1:
             self.append_line(f"== {added} repos queued, {self.parallel_spin.value()} at once")
         self._pump_queue()
         self._set_running(bool(self.workers))
+        self._save_unfinished()
+        self._update_banner()
 
     def _pump_queue(self) -> None:
         """Start queued downloads while there are free slots."""
         while self.queue and self._downloads_in_flight() < self.parallel_spin.value() and not self._exclusive_running():
-            repo_id, revision = self.queue.pop(0)
+            item = self.queue.pop(0)
             opts = self._options()
             finish_after = self.finish_after_cb.isChecked()
-            title = f"hf download {repo_id}" + (f" --revision {revision}" if revision else "")
+            repo_dir = opts.cache_path() / f"models--{item.repo_id.replace('/', '--')}"
+            if item.mode == "resume" and (repo_dir / "snapshots").is_dir():
+                # pick a cached, unfinished repo up: a finish pass limited to it (stale partials
+                # dropped, missing files fetched at the cached commit, then verify and move)
+                opts.filters = [item.repo_id]
+                opts.no_download = False
+                opts.dry_run = False
+                # a partial file written in the last two minutes looks like a live download to
+                # hffinish (it cannot know the process is gone); wait that out and then go on
+                opts.wait = True
+                opts.poll = 10
+                self._start(
+                    finish_job(opts),
+                    f"resuming {item.repo_id}: hffinish " + " ".join(opts.argv()),
+                    repo_ids=[item.repo_id],
+                    ctx=("download", [item.repo_id], not opts.no_move, item.revision),
+                )
+                continue
+            if item.mode == "resume":
+                self.append_line(f"{item.repo_id} is not in the cache yet, starting the download")
+            title = f"hf download {item.repo_id}" + (f" --revision {item.revision}" if item.revision else "")
             if finish_after:
-                title += ", then hffinish " + " ".join(opts.argv(filters=[repo_id]))
+                title += ", then hffinish " + " ".join(opts.argv(filters=[item.repo_id]))
             self._start(
-                download_job(repo_id, revision, opts, finish_after),
+                download_job(item.repo_id, item.revision, opts, finish_after),
                 title,
-                repo_ids=[repo_id],
-                ctx=("download", [repo_id], finish_after),
+                repo_ids=[item.repo_id],
+                ctx=("download", [item.repo_id], finish_after, item.revision),
             )
+
+    # -- remembering unfinished downloads across restarts
+
+    def _save_unfinished(self) -> None:
+        items: dict[str, QueueItem] = {}
+        for w in self.workers:
+            if w.ctx is not None and w.ctx[0] == "download":
+                for repo_id in w.ctx[1]:
+                    items[repo_id] = QueueItem(repo_id, w.ctx[3] if len(w.ctx) > 3 else "", "resume")
+        for item in self.queue:
+            items.setdefault(item.repo_id, QueueItem(item.repo_id, item.revision, "resume"))
+        for item in self.interrupted:
+            items.setdefault(item.repo_id, item)
+        self.settings.setValue("unfinished", json.dumps([it.as_dict() for it in items.values()]))
+
+    def _update_banner(self) -> None:
+        if not self.interrupted:
+            self.resume_banner.setVisible(False)
+            return
+        names = ", ".join(it.repo_id for it in self.interrupted[:4])
+        if len(self.interrupted) > 4:
+            names += f" and {len(self.interrupted) - 4} more"
+        self.resume_banner_label.setText(
+            f"<b>{len(self.interrupted)} download(s) did not finish:</b> {names}. "
+            "Files already fetched are kept; resuming fetches only what is missing."
+        )
+        self.resume_banner_label.setToolTip("\n".join(it.repo_id for it in self.interrupted))
+        self.resume_all_btn.setText("Resume all" if len(self.interrupted) > 1 else "Resume")
+        self.resume_banner.setVisible(True)
+
+    @Slot()
+    def resume_interrupted(self) -> None:
+        if self._exclusive_running():
+            self.statusBar().showMessage("Waiting for the cache check to finish, the downloads start right after it.", 6000)
+        items = [(it.repo_id, it.revision) for it in self.interrupted]
+        self.show_download_tab()
+        self._enqueue(items, mode="resume")
+
+    @Slot()
+    def dismiss_interrupted(self) -> None:
+        self.interrupted = []
+        self._save_unfinished()
+        self._update_banner()
 
     @Slot()
     def start_download_list(self) -> None:
@@ -2765,30 +2938,12 @@ class MainWindow(QMainWindow):
         commit, then the model is verified and moved. A repo that is not in the
         cache yet is simply downloaded.
         """
-        if self._exclusive_running():
-            QMessageBox.information(self, APP_NAME, "A pass over the whole cache is running. Wait for it or stop it first.")
-            return
         if repo_id in self.active_repos():
             self.statusBar().showMessage(f"{repo_id} is already being worked on", 5000)
             return
-        opts = self._options()
-        repo_dir = opts.cache_path() / f"models--{repo_id.replace('/', '--')}"
-        if not (repo_dir / "snapshots").is_dir():
-            self.append_line(f"{repo_id} is not in the cache yet, starting the download")
-            self.download_repo(repo_id, revision)
-            return
         self.show_download_tab()
         self.repo_edit.setText(repo_id)
-        opts.filters = [repo_id]
-        opts.no_download = False
-        opts.dry_run = False
-        self._start(
-            finish_job(opts),
-            f"resuming {repo_id}: hffinish " + " ".join(opts.argv()),
-            repo_ids=[repo_id],
-            ctx=("download", [repo_id], not opts.no_move),
-            clear=not self.workers and not self.queue,
-        )
+        self._enqueue([(repo_id, revision)], mode="resume")
 
     @Slot()
     def start_resume_field(self) -> None:
@@ -2806,16 +2961,38 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(0)
 
     @Slot()
+    def _dest_changed(self) -> None:
+        """The library folder was typed or chosen: apply it everywhere, no restart needed."""
+        text = self.dest_edit.text().strip()
+        if text:
+            text = os.path.normpath(os.path.expanduser(text))
+            if text != self.dest_edit.text():
+                self.dest_edit.setText(text)
+        if not self.library.where.hasFocus():
+            self.library.where.setText(text)
+        self.settings.setValue("dest", text)
+        dest = self._options().dest_path()
+        self.statusBar().showMessage(
+            f"library folder: {dest}" + ("" if dest.is_dir() else " (does not exist yet; it is created when a model is moved there)"),
+            8000,
+        )
+        self.library.refresh()
+        self.browse.refresh_local()
+
+    @Slot()
     def stop(self) -> None:
-        """Stop everything: empty the queue and cancel every running job."""
-        for repo_id, _rev in self.queue:
-            self._set_row(repo_id, "stopped", "removed from the queue", None)
+        """Stop everything: empty the queue and cancel every running job (all stay remembered as unfinished)."""
+        for item in self.queue:
+            self._set_row(item.repo_id, "stopped", "removed from the queue; remembered as unfinished", None)
+            self._remember_interrupted(item.repo_id, item.revision)
         self.queue.clear()
         if self.workers:
             self.append_line("stopping...")
         for w in list(self.workers):
             w.cancel()
         self._set_running(bool(self.workers))
+        self._save_unfinished()
+        self._update_banner()
 
     def _stop_repo(self, repo_id: str) -> None:
         """The Stop button of one progress row."""
@@ -2824,13 +3001,18 @@ class MainWindow(QMainWindow):
                 self.append_line(f"stopping {repo_id}...")
                 w.cancel()
                 return
-        before = len(self.queue)
-        self.queue = [(r, rev) for r, rev in self.queue if r != repo_id]
-        if len(self.queue) != before:
-            self._set_row(repo_id, "stopped", "removed from the queue", None)
+        queued = [item for item in self.queue if item.repo_id == repo_id]
+        if queued:
+            self.queue = [item for item in self.queue if item.repo_id != repo_id]
+            self._set_row(repo_id, "stopped", "removed from the queue; remembered as unfinished", None)
+            self._remember_interrupted(repo_id, queued[0].revision)
             return
         if repo_id in self.ext_meters:
             self._kill_external(repo_id)
+
+    def _remember_interrupted(self, repo_id: str, revision: str = "") -> None:
+        if all(it.repo_id != repo_id for it in self.interrupted):
+            self.interrupted.append(QueueItem(repo_id, revision, "resume"))
 
     def _clear_results(self) -> None:
         self.table.setRowCount(0)
@@ -2991,7 +3173,11 @@ class MainWindow(QMainWindow):
 
         ctx = w.ctx
         if ctx is not None and ctx[0] == "download":
-            _kind, repo_ids, finish_after = ctx
+            repo_ids, finish_after = ctx[1], ctx[2]
+            revision = ctx[3] if len(ctx) > 3 else ""
+            if rc != 0:
+                for repo_id in repo_ids:  # remembered until it is resumed or forgotten
+                    self._remember_interrupted(repo_id, revision)
             if not (finish_after and rc == 0):
                 # the download stopped, failed, or was not followed by the finish pass:
                 # check what is actually on disk before anyone trusts it
@@ -3001,6 +3187,8 @@ class MainWindow(QMainWindow):
                 self._report_verification(repo_id)
         self._pump_queue()
         self._set_running(bool(self.workers))
+        self._save_unfinished()
+        self._update_banner()
         if not self.workers:
             self.library.refresh()
             self.browse.refresh_local()
@@ -3125,8 +3313,13 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            for item in self.queue:  # running and queued downloads come back as "did not finish"
+                self._remember_interrupted(item.repo_id, item.revision)
             self.queue.clear()
             for w in self.workers:
+                if w.ctx is not None and w.ctx[0] == "download":
+                    for repo_id in w.ctx[1]:
+                        self._remember_interrupted(repo_id, w.ctx[3] if len(w.ctx) > 3 else "")
                 w.cancel()
             for w in self.workers:
                 w.wait(5000)

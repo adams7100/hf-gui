@@ -121,6 +121,19 @@ three tabs.
   and click "Download all". Lines that are not repos are shown before the run
   starts and skipped. The list is kept between starts, and the Hub browser's
   "Add to list" appends to it.
+- **Unfinished downloads survive a restart**: every running or queued download
+  is remembered (in the app's settings), as is any that stopped or failed.
+  When the window opens again a banner on the Download tab lists them with a
+  "Resume all" button, which picks each one up where it stopped (what is
+  already in the cache is kept, only the missing files are fetched, then the
+  model is verified and moved), or "Forget them". Resuming or finishing a
+  download removes it from the list.
+- **Library folder by typing**: the library folder field on the Download tab
+  and the one at the top of the Libraries tab are the same setting; type a
+  path into either (or Browse) and it applies as soon as you leave the field:
+  the Libraries list rescans and the Browse tab's Downloaded column is
+  re-checked. A folder that does not exist yet is created when the first
+  model is moved into it.
 - **Several at once**: downloads run side by side, as many as the "download N
   at once" box allows (default 3); the rest wait in a queue and start as slots
   free up. Each running download has its own row in the progress panel with
