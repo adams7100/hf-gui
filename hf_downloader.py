@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["huggingface_hub>=1.32", "PySide6>=6.6", "psutil>=5.9"]
+# dependencies = ["huggingface_hub>=1.32", "PySide6>=6.6", "psutil>=5.9", "markdown>=3.5"]
 # ///
 """HF-Downloader: Qt 6 desktop front end for hffinish.
 
@@ -43,7 +43,7 @@ from types import ModuleType
 from typing import Any
 
 from PySide6.QtCore import QObject, QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImage
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImage, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -76,6 +76,10 @@ try:  # network throughput for the progress panel; the window works without it
     import psutil
 except ImportError:  # pragma: no cover
     psutil = None  # type: ignore[assignment]
+try:  # model cards: Markdown -> HTML with tables, fenced code and inline HTML
+    import markdown as _markdown
+except ImportError:  # pragma: no cover - Qt's own Markdown renderer is the fallback
+    _markdown = None  # type: ignore[assignment]
 
 APP_NAME = "HF-Downloader"
 APP_VERSION = "1.2.0"
@@ -1509,8 +1513,12 @@ class LibraryTab(QWidget):
             self.window._dest_changed()
 
     def _browse_where(self) -> None:
-        start = self.where.text().strip() or str(self.window._options().dest_path())
-        chosen = QFileDialog.getExistingDirectory(self, "Choose the library folder", start)
+        # start where the library is now (the last used folder); if that folder is not there
+        # yet, start at its parent so the dialog opens somewhere sensible
+        start = Path(self.where.text().strip() or str(self.window._options().dest_path()))
+        while not start.is_dir() and start.parent != start:
+            start = start.parent
+        chosen = QFileDialog.getExistingDirectory(self, "Choose the library folder", str(start))
         if chosen:
             self.where.setText(os.path.normpath(chosen))
             self._where_changed()
@@ -2017,21 +2025,30 @@ class BrowseTab(QWidget):
         form.addRow("Pages:", order)
         root.addLayout(form)
 
+        # clickable legend: a chip filters the list to that category / download state and sorts by it
+        self.category_filter = ""
+        self.local_filter = ""
+        self.category_chips: dict[str, QPushButton] = {}
+        self.local_chips: dict[str, QPushButton] = {}
         legend = QHBoxLayout()
         legend.addWidget(QLabel("Categories:"))
         for name, color in CATEGORY_COLORS.items():
-            chip = QLabel(name)
-            chip.setStyleSheet(chip_style(color))
-            chip.setToolTip(f"{name} models: the Task column is coloured like this")
+            chip = self._chip(name, color, f"Show only {name} models, sorted by task; click again for all")
+            chip.clicked.connect(lambda _c=False, n=name: self._toggle_category(n))
+            self.category_chips[name] = chip
             legend.addWidget(chip)
         legend.addSpacing(24)
         legend.addWidget(QLabel("Downloaded:"))
         for name, color in LOCAL_COLORS.items():
             if name == "unverified":
                 continue
-            chip = QLabel(LIBRARY_LABELS.get(name, name))
-            chip.setStyleSheet(chip_style(color))
+            chip = self._chip(LIBRARY_LABELS.get(name, name), color, f"Show only models that are {LIBRARY_LABELS.get(name, name)}; click again for all")
+            chip.clicked.connect(lambda _c=False, n=name: self._toggle_local(n))
+            self.local_chips[name] = chip
             legend.addWidget(chip)
+        self.filter_label = QLabel("")
+        legend.addSpacing(12)
+        legend.addWidget(self.filter_label)
         legend.addStretch(1)
         root.addLayout(legend)
 
@@ -2078,6 +2095,48 @@ class BrowseTab(QWidget):
         root.addLayout(actions)
         self._selection_changed()
         self.next_btn.setEnabled(False)
+
+    # -- legend chips: filter + sort
+
+    @staticmethod
+    def _chip(text: str, color: str, tip: str) -> QPushButton:
+        chip = QPushButton(text)
+        chip.setCheckable(True)
+        chip.setCursor(Qt.CursorShape.PointingHandCursor)
+        chip.setToolTip(tip)
+        chip.setStyleSheet(
+            f"QPushButton {{ {chip_style(color)} border: 2px solid transparent; }}"
+            f"QPushButton:checked {{ border: 2px solid palette(text); font-weight: bold; }}"
+        )
+        return chip
+
+    def _toggle_category(self, name: str) -> None:
+        self.category_filter = "" if self.category_filter == name else name
+        self._apply_filters(sort_by_task=bool(self.category_filter))
+
+    def _toggle_local(self, name: str) -> None:
+        self.local_filter = "" if self.local_filter == name else name
+        self._apply_filters(sort_by_task=False)
+
+    def _apply_filters(self, sort_by_task: bool = False) -> None:
+        for name, chip in self.category_chips.items():
+            chip.setChecked(name == self.category_filter)
+        for name, chip in self.local_chips.items():
+            chip.setChecked(name == self.local_filter)
+        shown = 0
+        for row in range(self.table.rowCount()):
+            m = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            hide = (self.category_filter and m.category != self.category_filter) or (self.local_filter and m.local.state != self.local_filter)
+            self.table.setRowHidden(row, bool(hide))
+            shown += 0 if hide else 1
+        if sort_by_task:
+            self.table.sortItems(3, Qt.SortOrder.AscendingOrder)  # task column: models of one kind together
+        if self.category_filter or self.local_filter:
+            what = " and ".join(x for x in (self.category_filter, LIBRARY_LABELS.get(self.local_filter, self.local_filter) if self.local_filter else "") if x)
+            self.filter_label.setText(f"showing {shown} of {self.table.rowCount()} ({what})")
+        else:
+            self.filter_label.setText("")
+        self._selection_changed()
 
     # -- scraping
 
@@ -2181,7 +2240,7 @@ class BrowseTab(QWidget):
         elif not more:
             text += ", that is all of them"
         self.status.setText(text)
-        self._selection_changed()
+        self._apply_filters(sort_by_task=bool(self.category_filter))
 
     @staticmethod
     def _paint_local(item: QTableWidgetItem, local: LocalState) -> None:
@@ -2215,11 +2274,13 @@ class BrowseTab(QWidget):
                 continue
             m.local = local
             self._paint_local(self.table.item(row, 1), local)
+        if self.local_filter:
+            self._apply_filters()
 
     # -- selection
 
     def selected_models(self) -> list[HubModel]:
-        rows = sorted(idx.row() for idx in self.table.selectionModel().selectedRows())
+        rows = sorted(idx.row() for idx in self.table.selectionModel().selectedRows() if not self.table.isRowHidden(idx.row()))
         return [self.table.item(r, 0).data(Qt.ItemDataRole.UserRole) for r in rows]
 
     def selected(self) -> HubModel | None:
@@ -2358,6 +2419,68 @@ def absolutise(markdown: str, repo_id: str) -> tuple[str, list[str]]:
     return out, unique
 
 
+DETAILS_RE = re.compile(r"</?details\b[^>]*>", re.IGNORECASE)
+SUMMARY_OPEN_RE = re.compile(r"<summary\b[^>]*>", re.IGNORECASE)
+SUMMARY_CLOSE_RE = re.compile(r"</summary\s*>", re.IGNORECASE)
+STRIP_BLOCK_RE = re.compile(r"<(style|script)\b.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+VIDEO_RE = re.compile(r"<video\b.*?</video\s*>", re.IGNORECASE | re.DOTALL)
+SRC_ATTR_RE = re.compile(r"""src\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+
+def render_card_html(md_text: str) -> str:
+    """Model card Markdown -> HTML for QTextBrowser; "" when the markdown package is missing.
+
+    Collapsed <details> blocks are opened (their text would otherwise be lost),
+    <style>/<script> go, and <video> tags become links (Qt cannot play them).
+    """
+    text = STRIP_BLOCK_RE.sub("", md_text)
+    text = DETAILS_RE.sub("", text)
+    text = SUMMARY_OPEN_RE.sub("<p><b>", text)
+    text = SUMMARY_CLOSE_RE.sub("</b></p>", text)
+
+    def video(m: re.Match) -> str:
+        links = [f'<a href="{s}">[video: {s.rsplit("/", 1)[-1]}]</a>' for s in SRC_ATTR_RE.findall(m.group(0))]
+        return "<p>" + " ".join(links) + "</p>" if links else ""
+
+    text = VIDEO_RE.sub(video, text)
+    if _markdown is None:
+        return ""
+    try:
+        return _markdown.markdown(
+            text,
+            extensions=["tables", "fenced_code", "sane_lists", "md_in_html", "attr_list"],
+            output_format="html",
+        )
+    except Exception:  # noqa: BLE001 - an odd card must not break the window
+        return ""
+
+
+def is_dark(palette: QPalette) -> bool:
+    return palette.window().color().lightnessF() < 0.5
+
+
+def link_color(palette: QPalette) -> str:
+    return "#6cb4ff" if is_dark(palette) else "#0b57d0"
+
+
+def card_stylesheet(palette: QPalette) -> str:
+    """CSS for the card document: readable links in both themes, visible table borders, code blocks."""
+    dark = is_dark(palette)
+    code_bg = "#2a2d31" if dark else "#f1f3f4"
+    border = "#5a5f66" if dark else "#c9ccd1"
+    quiet = "#9aa0a6" if dark else "#5f6368"
+    return (
+        f"a {{ color: {link_color(palette)}; text-decoration: underline; }}"
+        f"code {{ background-color: {code_bg}; }}"
+        f"pre {{ background-color: {code_bg}; padding: 6px; }}"
+        f"table {{ border-collapse: collapse; }}"
+        f"td, th {{ border: 1px solid {border}; padding: 4px 8px; }}"
+        f"th {{ background-color: {code_bg}; font-weight: bold; }}"
+        f"blockquote {{ color: {quiet}; }}"
+        f"h1, h2, h3, h4 {{ color: {ACCENT}; }}"
+    )
+
+
 class CardWorker(QThread):
     """Fetches a model's info, file list, card text and the images the card shows."""
 
@@ -2415,6 +2538,15 @@ class CardView(QTextBrowser):
         self.setOpenExternalLinks(True)
         self.setOpenLinks(True)
 
+    def set_card(self, md_text: str) -> None:
+        """Render Markdown with the theme's stylesheet (links readable on dark and light)."""
+        self.document().setDefaultStyleSheet(card_stylesheet(self.palette()))
+        html = render_card_html(md_text) if md_text.strip() else ""
+        if html:
+            self.setHtml(html)
+        else:
+            self.setMarkdown(md_text)
+
     def loadResource(self, kind: int, name: QUrl):  # noqa: N802 - Qt API
         img = self.images.get(name.toString())
         if img is not None:
@@ -2470,6 +2602,9 @@ class ModelCardDialog(QDialog):
         buttons.addWidget(close_btn)
         root.addLayout(buttons)
 
+        files_box = QWidget()
+        files_layout = QVBoxLayout(files_box)
+        files_layout.setContentsMargins(0, 0, 0, 0)
         self.files = QTableWidget(0, 2)
         self.files.setHorizontalHeaderLabels(["File", "Size"])
         fh = self.files.horizontalHeader()
@@ -2480,9 +2615,24 @@ class ModelCardDialog(QDialog):
         self.files.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.files.setAlternatingRowColors(True)
         self.files.setSortingEnabled(True)
+        self.files.doubleClicked.connect(lambda _idx: self._view_file())
+        self.files.itemSelectionChanged.connect(self._file_selection_changed)
+        file_btns = QHBoxLayout()
+        self.file_hint = QLabel("Double-click a .json, .md or other text file to read it")
+        self.file_hint.setEnabled(False)
+        self.view_file_btn = QPushButton("View file")
+        self.view_file_btn.setToolTip("Show this file: JSON pretty-printed, Markdown rendered, other text as is")
+        self.view_file_btn.clicked.connect(self._view_file)
+        self.view_file_btn.setEnabled(False)
+        file_btns.addWidget(self.file_hint, 1)
+        file_btns.addWidget(self.view_file_btn)
+        files_layout.addWidget(self.files, 1)
+        files_layout.addLayout(file_btns)
+        self.file_dialog: FileViewerDialog | None = None
+        self.card_commit = ""
         self.view = CardView()
         split = QSplitter(Qt.Orientation.Vertical)
-        split.addWidget(self.files)
+        split.addWidget(files_box)
         split.addWidget(self.view)
         split.setStretchFactor(0, 1)
         split.setStretchFactor(1, 4)
@@ -2552,11 +2702,193 @@ class ModelCardDialog(QDialog):
         self.files.setSortingEnabled(True)
         self.files.horizontalHeaderItem(1).setText(f"Size ({hff.human(total)} in {len(card.files)} files)" if card.files else "Size")
         self.view.images = card.images
-        self.view.setMarkdown(card.markdown or "*No model card text.*")
+        self.view.set_card(card.markdown or "*No model card text.*")
+        self._file_selection_changed()
+
+    # -- single files
+
+    def _selected_file(self) -> tuple[str, int] | None:
+        rows = self.files.selectionModel().selectedRows()
+        if not rows:
+            return None
+        row = rows[0].row()
+        size_item = self.files.item(row, 1)
+        return self.files.item(row, 0).text(), int(getattr(size_item, "key", 0) or 0)
+
+    @Slot()
+    def _file_selection_changed(self) -> None:
+        sel = self._selected_file()
+        self.view_file_btn.setEnabled(sel is not None and is_text_file(sel[0]))
+        if sel is not None and not is_text_file(sel[0]):
+            self.file_hint.setText(f"{sel[0]} is a binary file; use Download or open it on huggingface.co")
+        else:
+            self.file_hint.setText("Double-click a .json, .md or other text file to read it")
+
+    def _view_file(self) -> None:
+        sel = self._selected_file()
+        if sel is None:
+            return
+        path, size = sel
+        if not is_text_file(path):
+            QMessageBox.information(self, APP_NAME, f"{path} is not a text file ({hff.human(size)}).")
+            return
+        if self.file_dialog is None:
+            self.file_dialog = FileViewerDialog(self)
+        self.file_dialog.load(self.repo_id, path, size)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
         if self.worker is not None:
             self.worker.ready.disconnect(self._ready)
+            self.worker = None
+        if self.file_dialog is not None:
+            self.file_dialog.close()
+        event.accept()
+
+
+TEXT_FILE_EXTS = {
+    ".json", ".md", ".markdown", ".txt", ".yaml", ".yml", ".py", ".toml", ".cfg", ".ini", ".csv", ".tsv",
+    ".jinja", ".jinja2", ".j2", ".modelfile", ".tiktoken", ".vocab", ".merges", ".license", ".rst", ".xml",
+    ".html", ".htm", ".js", ".ts", ".sh", ".bat", ".cmd", ".ps1", ".cu", ".cpp", ".c", ".h", ".hpp", ".java",
+    ".gitattributes", ".gitignore", ".model_card", ".log", ".bib", ".tex", ".properties", ".conf",
+}
+TEXT_FILE_NAMES = {"license", "readme", "modelfile", "notice", "changelog", "authors", "contributing", "version"}
+MAX_TEXT_FILE_BYTES = 8 << 20
+
+
+def is_text_file(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    ext = os.path.splitext(name)[1].lower()
+    if ext in TEXT_FILE_EXTS or name.lower() in TEXT_FILE_EXTS:  # the latter: dotfiles like .gitattributes
+        return True
+    return name.lower() in TEXT_FILE_NAMES or (not ext and name.lower().split(".")[0] in TEXT_FILE_NAMES)
+
+
+class FileWorker(QThread):
+    """Fetches one file of a repo straight from the Hub (not through the cache)."""
+
+    ready = Signal(str, str, bytes)  # repo id, path, data
+    failed = Signal(str, str, str)  # repo id, path, message
+
+    def __init__(self, repo_id: str, path: str, parent=None) -> None:
+        super().__init__(parent)
+        self.repo_id = repo_id
+        self.path = path
+
+    def run(self) -> None:
+        url = f"{HUB_URL}/{self.repo_id}/resolve/main/{urllib.parse.quote(self.path)}"
+        try:
+            data = fetch_url(url, limit=MAX_TEXT_FILE_BYTES + 1, timeout=60)
+        except urllib.error.HTTPError as exc:
+            self.failed.emit(self.repo_id, self.path, f"HTTP {exc.code}" + (" (gated or private; log in with `hf auth login`)" if exc.code in (401, 403) else ""))
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(self.repo_id, self.path, f"{type(exc).__name__}: {exc}")
+            return
+        if len(data) > MAX_TEXT_FILE_BYTES:
+            self.failed.emit(self.repo_id, self.path, f"larger than {hff.human(MAX_TEXT_FILE_BYTES)}; open it on huggingface.co instead")
+            return
+        self.ready.emit(self.repo_id, self.path, data)
+
+
+class FileViewerDialog(QDialog):
+    """Shows one text file of a repo: JSON pretty-printed, Markdown rendered, anything else as text."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.resize(860, 640)
+        self.worker: FileWorker | None = None
+        self.repo_id = ""
+        self.path = ""
+        root = QVBoxLayout(self)
+        self.title = QLabel()
+        self.title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(self.title)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.rendered = CardView()
+        root.addWidget(self.text, 1)
+        root.addWidget(self.rendered, 1)
+        buttons = QHBoxLayout()
+        self.raw_btn = QPushButton("Show source")
+        self.raw_btn.setCheckable(True)
+        self.raw_btn.toggled.connect(self._toggle_raw)
+        copy_btn = QPushButton("Copy")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self.text.toPlainText()))
+        open_btn = QPushButton("Open on huggingface.co")
+        open_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(f"{HUB_URL}/{self.repo_id}/blob/main/{urllib.parse.quote(self.path)}")))
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        mark(close_btn, "primary")
+        buttons.addWidget(self.raw_btn)
+        buttons.addWidget(copy_btn)
+        buttons.addWidget(open_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        root.addLayout(buttons)
+        self._is_markdown = False
+
+    def load(self, repo_id: str, path: str, size: int) -> None:
+        self.repo_id, self.path = repo_id, path
+        self.setWindowTitle(f"{path} - {repo_id}")
+        self.title.setText(f"<b>{path}</b> ({hff.human(size)}) in {repo_id}: loading...")
+        self.text.setPlainText("")
+        self.rendered.set_card("")
+        self._is_markdown = path.lower().endswith((".md", ".markdown"))
+        self.raw_btn.setVisible(self._is_markdown)
+        self.raw_btn.setChecked(False)
+        self._toggle_raw(False)
+        if self.worker is not None:
+            self.worker.ready.disconnect(self._ready)
+            self.worker.failed.disconnect(self._failed)
+        self.worker = FileWorker(repo_id, path, self)
+        self.worker.ready.connect(self._ready)
+        self.worker.failed.connect(self._failed)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker.start()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _toggle_raw(self, raw: bool) -> None:
+        show_rendered = self._is_markdown and not raw
+        self.rendered.setVisible(show_rendered)
+        self.text.setVisible(not show_rendered)
+
+    @Slot(str, str, bytes)
+    def _ready(self, repo_id: str, path: str, data: bytes) -> None:
+        self.worker = None
+        if (repo_id, path) != (self.repo_id, self.path):
+            return
+        text = data.decode("utf-8", "replace")
+        kind = "text"
+        if path.lower().endswith(".json"):
+            try:
+                text = json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+                kind = "JSON, pretty-printed"
+            except ValueError:
+                kind = "JSON (could not be parsed, shown as is)"
+        elif self._is_markdown:
+            kind = "Markdown, rendered"
+            _meta, body = split_front_matter(text)
+            body, _urls = absolutise(body, repo_id)
+            self.rendered.set_card(body)
+        self.text.setPlainText(text)
+        self.title.setText(f"<b>{path}</b> ({hff.human(len(data))}, {kind}) in {repo_id}")
+
+    @Slot(str, str, str)
+    def _failed(self, repo_id: str, path: str, message: str) -> None:
+        self.worker = None
+        if (repo_id, path) != (self.repo_id, self.path):
+            return
+        self.title.setText(f"<b>{path}</b> in {repo_id}: <span style='color:#c5221f'>could not load: {message}</span>")
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
+        if self.worker is not None:
+            self.worker.ready.disconnect(self._ready)
+            self.worker.failed.disconnect(self._failed)
             self.worker = None
         event.accept()
 
@@ -3040,8 +3372,10 @@ class MainWindow(QMainWindow):
         btn = QPushButton("Browse...")
 
         def browse() -> None:
-            start = edit.text().strip() or edit.placeholderText()
-            chosen = QFileDialog.getExistingDirectory(self, title, start)
+            start = Path(edit.text().strip() or edit.placeholderText())  # the last used folder
+            while not start.is_dir() and start.parent != start:
+                start = start.parent
+            chosen = QFileDialog.getExistingDirectory(self, title, str(start))
             if chosen:
                 edit.setText(os.path.normpath(chosen))
 
@@ -3083,6 +3417,7 @@ class MainWindow(QMainWindow):
         s = self.settings
         self.cache_edit.setText(s.value("cache_dir", "", str))
         self.dest_edit.setText(s.value("dest", "", str))
+        self.library.where.setText(self.dest_edit.text())  # the Libraries tab starts at the last used folder
         self.filter_edit.setText(s.value("filters", "", str))
         self.layout_combo.setCurrentText(s.value("layout", "flat", str))
         self.merge_cb.setChecked(s.value("merge", False, bool))
@@ -3956,6 +4291,9 @@ def main(argv: list[str]) -> int:
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))
     app.setStyleSheet(THEME)
+    pal = app.palette()
+    pal.setColor(QPalette.ColorRole.Link, QColor(link_color(pal)))  # Qt's default link blue vanishes on dark
+    app.setPalette(pal)
     win = MainWindow()
     win.show()
     if "--selftest" in argv:

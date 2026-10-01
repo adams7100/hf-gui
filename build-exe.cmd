@@ -22,6 +22,7 @@ if not exist "%PY%" (
 "%PY%" -c "import PyInstaller" >nul 2>nul || "%PY%" -m pip install --quiet pyinstaller || exit /b 2
 "%PY%" -c "import PySide6" >nul 2>nul || "%PY%" -m pip install --quiet "PySide6>=6.6" || exit /b 2
 "%PY%" -c "import psutil" >nul 2>nul || "%PY%" -m pip install --quiet "psutil>=5.9" || exit /b 2
+"%PY%" -c "import markdown" >nul 2>nul || "%PY%" -m pip install --quiet "markdown>=3.5" || exit /b 2
 if not exist "%ICON%" "%PY%" "%HERE%make_icon.py" || exit /b 2
 
 if exist "%WORK%" rmdir /s /q "%WORK%"

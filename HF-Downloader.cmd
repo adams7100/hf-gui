@@ -23,9 +23,9 @@ if %errorlevel%==0 set "BOOT=py -3"
 "%PY%" -m pip install --quiet --upgrade pip || goto fail
 
 :deps
-"%PY%" -c "import huggingface_hub, PySide6, psutil" >nul 2>nul || (
-    echo HF-Downloader: installing huggingface_hub, PySide6 and psutil ...
-    "%PY%" -m pip install --quiet "huggingface_hub>=1.32" "PySide6>=6.6" "psutil>=5.9" || goto fail
+"%PY%" -c "import huggingface_hub, PySide6, psutil, markdown" >nul 2>nul || (
+    echo HF-Downloader: installing huggingface_hub, PySide6, psutil and markdown ...
+    "%PY%" -m pip install --quiet "huggingface_hub>=1.32" "PySide6>=6.6" "psutil>=5.9" "markdown>=3.5" || goto fail
 )
 start "" "%PYW%" "%HERE%hf_downloader.py" %*
 exit /b 0
@@ -40,5 +40,5 @@ exit /b 2
 echo HF-Downloader: could not set up the Python environment in "%VENV%". 1>&2
 echo Delete that folder and run this again, or create it by hand: 1>&2
 echo   python -m venv "%VENV%" 1>&2
-echo   "%PY%" -m pip install "huggingface_hub>=1.32" "PySide6>=6.6" "psutil>=5.9" 1>&2
+echo   "%PY%" -m pip install "huggingface_hub>=1.32" "PySide6>=6.6" "psutil>=5.9" "markdown>=3.5" 1>&2
 exit /b 2

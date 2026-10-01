@@ -226,6 +226,18 @@ images, the front-matter facts (license, base model, language, tags, ...),
 download, like and task statistics, and the file list with sizes. Nothing of
 this touches the hub cache; the card and its pictures are fetched directly.
 
+The legend chips above the table are buttons: click a category (Text,
+Image, ...) to show only that category's models, sorted by task so models
+of one kind sit together; click a download state to show only models in
+that state; click a chip again to show everything. In the model card
+window the card is converted to HTML with the `markdown` package (tables,
+fenced code, inline HTML; collapsed `<details>` blocks are opened) and shown
+with a stylesheet that keeps links readable in dark and light themes. The
+file list has a "View file" button (also a double-click) for text files:
+`.json` is pretty-printed, `.md` is rendered (with a "Show source" toggle),
+`.txt`, `.yaml`, `.py` and the like are shown as text; files above 8 MB and
+binary files are left to "Open on huggingface.co".
+
 The **Downloaded** column says whether a listed model is already on this
 machine: "in library" (a folder with files in the library, in either
 layout), "in cache" (complete in the hub cache), "incomplete",
@@ -260,7 +272,7 @@ against the Hub for the selected cached model. Double-click a row or use
 is shown and after every job.
 
 Settings are remembered between starts. Start it with `HF-Downloader.cmd`
-(creates `.venv` with `huggingface_hub`, `PySide6` and `psutil` on first run)
+(creates `.venv` with `huggingface_hub`, `PySide6`, `psutil` and `markdown` on first run)
 or `python hf_downloader.py`. `tests\test_parse.py` checks the link and list
 parsers and the model card helpers.
 
