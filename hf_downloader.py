@@ -42,6 +42,12 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+# Download only, never upload: no Hub write API is used anywhere in this
+# window or in hffinish, and huggingface_hub's usage telemetry is switched off
+# before the library is imported (hffinish repeats this for its own process).
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("DISABLE_TELEMETRY", "1")
+
 from PySide6.QtCore import QObject, QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImage, QPalette
 from PySide6.QtWidgets import (

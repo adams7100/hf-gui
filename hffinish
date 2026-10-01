@@ -60,6 +60,14 @@ try:  # Windows: region locks, what huggingface_hub's filelock uses there
 except ImportError:  # POSIX
     msvcrt = None  # type: ignore[assignment]
 
+# Download only. This tool never uploads: every Hub call it makes is a read
+# (file lists, repo info, downloads). The opt-out below also stops
+# huggingface_hub's usage telemetry, here and in every hf process started from
+# here (they inherit the environment). Set before huggingface_hub is imported,
+# because it reads the variables once at import time.
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("DISABLE_TELEMETRY", "1")
+
 from huggingface_hub import HfApi, constants
 from huggingface_hub.hf_api import RepoFile
 

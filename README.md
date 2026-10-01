@@ -23,7 +23,7 @@ A repo that another process is downloading right now is left alone. Pass
 
 | Installer | Version | Size | SHA-256 |
 | --- | --- | --- | --- |
-| [`HF-Downloader-setup-1.2.0.exe`](https://github.com/adams7100/hf-gui/releases) | 1.2.0 | 56 MB | `8c0b96f2e2a908b4b265f851332958250a03a563defc872762c20d6581c7d283` |
+| [`HF-Downloader-setup-1.2.0.exe`](https://github.com/adams7100/hf-gui/releases) | 1.2.0 | 56 MB | `5e19a6bf7e0e0212dc4efeee1fcb6837beb1c809c0ca8d225dc10fa3a9dd7dd6` |
 
 Windows 10/11, 64-bit, no Python needed. Installers are attached to the
 [Releases](https://github.com/adams7100/hf-gui/releases) page; each one is
@@ -32,6 +32,20 @@ built from the tagged commit with `build-installer.cmd` (see
 file is unsigned, so SmartScreen may warn once; choose "More info" and "Run
 anyway".
 
+## Network use: download only
+
+The application never uploads anything. Every call it makes to the Hub is a
+read: the model listing, repo info and file lists (`GET` requests through
+`huggingface_hub`), model cards and their images, and the file downloads
+themselves (`hf download` or `snapshot_download`). No Hub write API
+(`upload_file`, `create_commit`, likes, discussions, ...) is used
+anywhere, no `hf` subcommand other than `download` is ever started, and
+`huggingface_hub`'s usage telemetry is switched off at start-up
+(`HF_HUB_DISABLE_TELEMETRY=1`, inherited by every `hf` process the window
+starts). Checksums are verified by hashing files locally against the sizes
+and digests the Hub reports; nothing about your files leaves the machine.
+`tests\test_no_upload.py` scans both sources and fails the moment a write
+API, an HTTP write method or another `hf` subcommand appears.
 ## Requirements
 
 - [`uv`](https://docs.astral.sh/uv/): the script declares its own dependency
@@ -287,7 +301,8 @@ is shown and after every job.
 Settings are remembered between starts. Start it with `HF-Downloader.cmd`
 (creates `.venv` with `huggingface_hub`, `PySide6`, `psutil` and `markdown` on first run)
 or `python hf_downloader.py`. `tests\test_parse.py` checks the link and list
-parsers and the model card helpers.
+parsers and the model card helpers; `tests\test_no_upload.py` checks that no
+upload path exists (see [Network use](#network-use-download-only)).
 
 ### Run it (command line)
 
