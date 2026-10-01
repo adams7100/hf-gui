@@ -250,6 +250,18 @@ class Transfer:
     final: bool = False
 
 
+def rate(bytes_per_s: float) -> str:
+    """'85.3 MB/s (682 Mbit/s)' for the progress panel."""
+    bits = bytes_per_s * 8
+    if bits >= 1e9:
+        bit_text = f"{bits / 1e9:.2f} Gbit/s"
+    elif bits >= 1e6:
+        bit_text = f"{bits / 1e6:.0f} Mbit/s"
+    else:
+        bit_text = f"{bits / 1e3:.0f} kbit/s"
+    return f"{hff.human(bytes_per_s)}/s ({bit_text})"
+
+
 class TransferMeter(threading.Thread):
     """Measures a download once a second: bytes of the repo on disk and network throughput.
 
@@ -1732,17 +1744,24 @@ class MainWindow(QMainWindow):
         self.download_btn = QPushButton("Download")
         self.download_btn.setToolTip("Downloads into the hub cache; files that are already complete are skipped, so this also resumes")
         self.download_btn.clicked.connect(self.start_download)
+        self.resume_btn = QPushButton("Resume")
+        self.resume_btn.setToolTip(
+            "Pick up a stopped download of this repo: complete files are kept, stale partial files are "
+            "removed and the rest is fetched again, then the model is verified and moved"
+        )
+        self.resume_btn.clicked.connect(self.start_resume_field)
         dl_row.addWidget(QLabel("Repo:"))
         dl_row.addWidget(self.repo_edit, 1)
         dl_row.addWidget(QLabel("Revision:"))
         dl_row.addWidget(self.rev_edit)
         dl_row.addWidget(self.finish_after_cb)
         dl_row.addWidget(self.download_btn)
+        dl_row.addWidget(self.resume_btn)
         dl_box.addLayout(dl_row)
         hint = QLabel(
             "Accepts  org/name,  hf download org/name,  https://huggingface.co/org/name?clone=true,  "
             ".../tree/&lt;revision&gt;  and  git clone ... forms. A download that stops is verified file "
-            "by file; click Download again to resume it."
+            "by file; click Resume to pick it up where it stopped."
         )
         hint.setWordWrap(True)
         hint.setEnabled(False)  # the disabled text colour reads as a hint in light and dark themes
@@ -2100,12 +2119,43 @@ class MainWindow(QMainWindow):
         self._verify_ctx = ids
         self._start(finish_job(opts), f"verifying {', '.join(ids)}: hffinish " + " ".join(opts.argv()))
 
-    def start_resume(self, repo_id: str) -> None:
-        """Fetch what is missing of one cached repo and move it (a finish pass limited to it)."""
+    def start_resume(self, repo_id: str, revision: str = "") -> None:
+        """Pick a download up where it stopped.
+
+        For a repo that is in the cache this is a finish pass limited to it:
+        complete files are kept, stale partial files are dropped (huggingface_hub
+        never appends to them), the rest is downloaded again at the cached
+        commit, then the model is verified and moved. A repo that is not in the
+        cache yet is simply downloaded.
+        """
+        if self.worker is not None:
+            QMessageBox.information(self, APP_NAME, "A job is already running. Stop it first.")
+            return
         opts = self._options()
+        repo_dir = opts.cache_path() / f"models--{repo_id.replace('/', '--')}"
+        if not (repo_dir / "snapshots").is_dir():
+            self.append_line(f"{repo_id} is not in the cache yet, starting the download")
+            self.download_repo(repo_id, revision)
+            return
+        self.show_download_tab()
+        self.repo_edit.setText(repo_id)
         opts.filters = [repo_id]
         opts.no_download = False
+        opts.dry_run = False
+        self._download_ctx = ([repo_id], not opts.no_move)
         self._start(finish_job(opts), f"resuming {repo_id}: hffinish " + " ".join(opts.argv()))
+
+    @Slot()
+    def start_resume_field(self) -> None:
+        try:
+            repo_id, revision = parse_repo_ref(self.repo_edit.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        self.repo_edit.setText(repo_id)
+        if revision:
+            self.rev_edit.setText(revision)
+        self.start_resume(repo_id, self.rev_edit.text().strip())
 
     def show_download_tab(self) -> None:
         self.tabs.setCurrentIndex(0)
@@ -2149,13 +2199,13 @@ class MainWindow(QMainWindow):
             self.xfer_bar.setRange(0, 1000)
             self.xfer_bar.setValue(1000 if t.total and t.done >= t.total else self.xfer_bar.value())
             return
-        bits = [f"{t.label}: {hff.human(t.speed)}/s"]
+        bits = [f"{t.label}: {rate(t.speed)}"]
         if t.total > 0 and t.speed > 0 and t.done < t.total:
             secs = int((t.total - t.done) / t.speed)
             eta = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}" if secs >= 3600 else f"{secs // 60}:{secs % 60:02d}"
             bits.append(f"ETA {eta}")
         if t.down >= 0:
-            bits.append(f"network down {hff.human(t.down)}/s, up {hff.human(t.up)}/s")
+            bits.append(f"network down {rate(t.down)}, up {rate(t.up)}")
         self.xfer_label.setText("   ".join(bits))
 
     @Slot(int)
@@ -2191,14 +2241,22 @@ class MainWindow(QMainWindow):
         if status in ("ready", "complete"):
             self.append_line(f"verified: {repo_id} is complete in the cache ({note}). Finish and move puts it in the library.")
         elif status == "incomplete":
-            self.append_line(f"verified: {repo_id} is incomplete, {note}. Click Download again to resume (complete files are skipped).")
+            self.append_line(f"verified: {repo_id} is incomplete, {note}. Click Resume to pick it up (complete files are kept).")
         elif row is None:
             self.append_line(f"verified: nothing of {repo_id} is in the cache.")
         else:
             self.append_line(f"verified: {repo_id} is {status}: {note}")
 
     def _set_running(self, running: bool) -> None:
-        for wdg in (self.download_btn, self.download_all_btn, self.scan_btn, self.run_btn, self.repo_edit, self.rev_edit):
+        for wdg in (
+            self.download_btn,
+            self.resume_btn,
+            self.download_all_btn,
+            self.scan_btn,
+            self.run_btn,
+            self.repo_edit,
+            self.rev_edit,
+        ):
             wdg.setEnabled(not running)
         self.stop_btn.setEnabled(running)
         self.busy.setVisible(running)

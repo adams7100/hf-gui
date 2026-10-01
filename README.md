@@ -123,11 +123,20 @@ three tabs.
   not repos are shown before the run starts and skipped. The list is kept
   between starts, and the Hub browser's "Add to list" appends to it.
 - **Progress**: while a download runs, a progress bar shows bytes in the cache
-  against the size the Hub reports for the repo, with the download speed into
-  the cache, an ETA, and the machine's network throughput in both directions
-  (download and upload, from `psutil`). The meter watches the repo's blobs
-  folder once a second, so it is exact whatever downloader is at work,
-  including a resume started by the finish pass.
+  against the size the Hub reports for the repo, with the download rate into
+  the cache as bytes and bits per second (`85.3 MB/s (682 Mbit/s)`), an ETA,
+  and the machine's network throughput in both directions (download and
+  upload, from `psutil`). The meter watches the repo's blobs folder once a
+  second, so it is exact whatever downloader is at work, including a resume
+  started by the finish pass.
+- **Resume**: a stopped download (Stop, crash, lost network, closed window)
+  is picked up with the Resume button next to Download, or "Resume download"
+  on the Libraries tab. Complete files are kept; partial `*.incomplete` files
+  are removed first because huggingface_hub never appends to one (every
+  download goes to a fresh uniquely named temporary file), and only the
+  missing files are fetched again, at the commit the cache already holds.
+  Then the model is verified and moved. A repo that is not in the cache yet
+  is simply downloaded.
 - **Verification when a download stops**: if the download fails, is stopped,
   or is not followed by the finish pass, the window immediately checks that
   repo in the cache file by file against the Hub's file list and reports
