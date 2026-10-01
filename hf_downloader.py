@@ -740,81 +740,140 @@ class LibraryScanner(QThread):
                     rev = hff.pick_revision(info)
                     if rev is None:
                         continue
-                    entries.append(self._cache_entry(info, rev))
+                    entries.append(cache_entry(info, rev, self.dest, self.cache, self.layout))
         except OSError:
             pass
         self.found.emit(entries)
 
-    def _cache_entry(self, info, rev) -> LibraryEntry:
-        entry = self._entry(info.repo_id, rev.snapshot_path, "in cache")
-        entry.repo_id = info.repo_id
-        repo = hff.Repo(info, rev)
-        tree_file = info.repo_path / "trees" / f"{rev.commit_hash}.json"
-        tree: dict[str, int] | None = None
-        try:
-            data = json.loads(tree_file.read_text())
-            if data.get("format_version") == 1:
-                tree = {p: int(e["size"]) for p, e in data["files"].items()}
-        except (OSError, ValueError, KeyError, TypeError):
-            tree = None
-        if tree is None:
-            repo.partials = sorted((info.repo_path / "blobs").glob("*.incomplete"))
-            entry.state = "unverified"
-            entry.note = "no file list on disk; select it and click Verify"
-            if repo.partials:
-                entry.note = f"{len(repo.partials)} partial file(s) ({hff.human(repo.partial_bytes)}); " + entry.note
-            return entry
-        repo.tree = tree
-        hff.check(repo, repo.staging(self.dest, self.layout))
-        entry.expected_files = len(tree)
-        entry.expected_size = repo.total_bytes
-        todo = repo.missing + repo.bad
-        if not todo:
-            entry.state = "in cache"
-            entry.note = "complete; Finish and move puts it in the library"
-            return entry
-        need = sum(tree[r] for r in todo)
-        entry.files = len(tree) - len(todo)
-        entry.size = max(entry.expected_size - need, 0)
-        active = self._download_in_progress(info)
-        entry.state = "downloading" if active else "incomplete"
-        entry.note = f"{len(repo.missing)} missing, {len(repo.bad)} bad of {len(tree)} files, {hff.human(need)} still to fetch"
-        if repo.partials:
-            entry.note += f"; {len(repo.partials)} partial file(s) ({hff.human(repo.partial_bytes)})"
-        if active:
-            entry.note = f"another process is downloading it ({active}); " + entry.note
-        return entry
-
-    def _download_in_progress(self, info) -> str:
-        """Cheap local version of hffinish.active_reason: locks and fresh partial files only
-        (no process listing, which costs a PowerShell start per repo on Windows)."""
-        for lock in (self.cache / ".locks" / info.repo_path.name).glob("*.lock"):
-            if hff.lock_is_held(lock):
-                return "download lock held"
-        now = time.time()
-        for part in (info.repo_path / "blobs").glob("*.incomplete"):
-            try:
-                age = now - part.stat().st_mtime
-            except OSError:
-                continue
-            if age < hff.ACTIVE_WINDOW_S:
-                return f"partial file written {int(age)}s ago"
-        return ""
-
     @staticmethod
     def _entry(name: str, path: Path, state: str) -> LibraryEntry:
-        files = size = 0
-        modified = 0.0
-        for root, _dirs, names in os.walk(path):
-            for fn in names:
-                try:
-                    st = os.stat(os.path.join(root, fn))
-                except OSError:
-                    continue
-                files += 1
-                size += st.st_size
-                modified = max(modified, st.st_mtime)
-        return LibraryEntry(name, path, state, files, size, modified)
+        return folder_entry(name, path, state)
+
+
+def folder_entry(name: str, path: Path, state: str) -> LibraryEntry:
+    files = size = 0
+    modified = 0.0
+    for root, _dirs, names in os.walk(path):
+        for fn in names:
+            try:
+                st = os.stat(os.path.join(root, fn))
+            except OSError:
+                continue
+            files += 1
+            size += st.st_size
+            modified = max(modified, st.st_mtime)
+    return LibraryEntry(name, path, state, files, size, modified)
+
+
+def download_in_progress(info, cache: Path) -> str:
+    """Cheap local version of hffinish.active_reason: locks and fresh partial files only
+    (no process listing, which costs a PowerShell start per repo on Windows)."""
+    for lock in (cache / ".locks" / info.repo_path.name).glob("*.lock"):
+        if hff.lock_is_held(lock):
+            return "download lock held"
+    now = time.time()
+    for part in (info.repo_path / "blobs").glob("*.incomplete"):
+        try:
+            age = now - part.stat().st_mtime
+        except OSError:
+            continue
+        if age < hff.ACTIVE_WINDOW_S:
+            return f"partial file written {int(age)}s ago"
+    return ""
+
+
+def cache_entry(info, rev, dest: Path, cache: Path, layout: str) -> LibraryEntry:
+    """What the cache holds of one repo, checked against the on-disk file list (no network)."""
+    entry = folder_entry(info.repo_id, rev.snapshot_path, "in cache")
+    entry.repo_id = info.repo_id
+    repo = hff.Repo(info, rev)
+    tree_file = info.repo_path / "trees" / f"{rev.commit_hash}.json"
+    tree: dict[str, int] | None = None
+    try:
+        data = json.loads(tree_file.read_text())
+        if data.get("format_version") == 1:
+            tree = {p: int(e["size"]) for p, e in data["files"].items()}
+    except (OSError, ValueError, KeyError, TypeError):
+        tree = None
+    if tree is None:
+        repo.partials = sorted((info.repo_path / "blobs").glob("*.incomplete"))
+        entry.state = "unverified"
+        entry.note = "no file list on disk; select it and click Verify"
+        if repo.partials:
+            entry.note = f"{len(repo.partials)} partial file(s) ({hff.human(repo.partial_bytes)}); " + entry.note
+        return entry
+    repo.tree = tree
+    hff.check(repo, repo.staging(dest, layout))
+    entry.expected_files = len(tree)
+    entry.expected_size = repo.total_bytes
+    todo = repo.missing + repo.bad
+    if not todo:
+        entry.state = "in cache"
+        entry.note = "complete; Finish and move puts it in the library"
+        return entry
+    need = sum(tree[r] for r in todo)
+    entry.files = len(tree) - len(todo)
+    entry.size = max(entry.expected_size - need, 0)
+    active = download_in_progress(info, cache)
+    entry.state = "downloading" if active else "incomplete"
+    entry.note = f"{len(repo.missing)} missing, {len(repo.bad)} bad of {len(tree)} files, {hff.human(need)} still to fetch"
+    if repo.partials:
+        entry.note += f"; {len(repo.partials)} partial file(s) ({hff.human(repo.partial_bytes)})"
+    if active:
+        entry.note = f"another process is downloading it ({active}); " + entry.note
+    return entry
+
+
+@dataclass
+class LocalState:
+    """Whether a repo is already on this machine: in the library, in the cache, or not at all."""
+
+    state: str = ""  # "" | in library | in cache | incomplete | downloading | unverified
+    path: Path | None = None
+    note: str = ""
+
+    @property
+    def downloaded(self) -> bool:
+        """Completely on disk: a Download would fetch nothing new."""
+        return self.state in ("in library", "in cache")
+
+
+class LocalIndex:
+    """Looks repos up on disk. Built once per page / refresh, off the GUI thread."""
+
+    def __init__(self, dest: Path, cache: Path, layout: str) -> None:
+        self.dest = dest
+        self.cache = cache
+        self.layout = layout
+        self.cached: dict[str, tuple[Any, Any]] = {}
+        try:
+            if cache.is_dir():
+                for info in hff.scan_cache(cache):
+                    if info.repo_type != "model":
+                        continue
+                    rev = hff.pick_revision(info)
+                    if rev is not None:
+                        self.cached[info.repo_id.lower()] = (info, rev)
+        except OSError:
+            pass
+
+    def lookup(self, repo_id: str) -> LocalState:
+        org, _, name = repo_id.partition("/")
+        for folder in (self.dest / name, self.dest / org / name):  # both layouts, whatever is set now
+            try:
+                if folder.is_dir() and any(p.is_file() for p in folder.rglob("*")):
+                    return LocalState("in library", folder, f"in the library at {folder}")
+            except OSError:
+                continue
+        hit = self.cached.get(repo_id.lower())
+        if hit is None:
+            return LocalState()
+        info, rev = hit
+        try:
+            entry = cache_entry(info, rev, self.dest, self.cache, self.layout)
+        except OSError:
+            return LocalState("unverified", info.repo_path, "in the hub cache")
+        return LocalState(entry.state, entry.path, f"in the hub cache: {entry.note}")
 
 
 class LibraryTab(QWidget):
@@ -924,7 +983,7 @@ class LibraryTab(QWidget):
                 if col == 1:
                     color = LIBRARY_COLORS.get(e.state)
                     if color:
-                        item.setForeground(QColor(color))
+                        tint_item(item, QColor(color))
                 self.table.setItem(row, col, item)
         self.table.setSortingEnabled(True)
         self._selection_changed()
@@ -1039,6 +1098,59 @@ MAX_CARD_IMAGES = 24
 MAX_IMAGE_BYTES = 15 << 20
 MAX_IMAGE_WIDTH = 900
 
+# model categories (families of pipeline tags) and their colours
+ACCENT = "#ff9d00"  # Hugging Face yellow-orange, the window's accent
+CATEGORY_COLORS = {
+    "Multimodal": "#e8710a",
+    "Text": "#1a73e8",
+    "Image": "#9334e6",
+    "Video": "#d01884",
+    "Audio": "#1e8e3e",
+    "Embeddings": "#12838f",
+    "Agents": "#8a5a00",
+    "Other": "#5f6368",
+}
+LOCAL_COLORS = {
+    "in library": "#1e8e3e",
+    "in cache": "#1a73e8",
+    "incomplete": "#b06000",
+    "downloading": "#b06000",
+    "unverified": "#5f6368",
+}
+
+
+def task_category(task: str) -> str:
+    t = (task or "").lower()
+    if not t:
+        return "Other"
+    if t in ("any-to-any", "image-text-to-text", "image-to-text", "visual-question-answering", "document-question-answering", "video-text-to-text", "audio-text-to-text", "visual-document-retrieval"):
+        return "Multimodal"
+    if "video" in t:
+        return "Video"
+    if any(k in t for k in ("image", "depth", "object-detection", "segmentation", "mask-generation", "keypoint", "unconditional")):
+        return "Image"
+    if any(k in t for k in ("audio", "speech", "voice")):
+        return "Audio"
+    if any(k in t for k in ("feature-extraction", "sentence-similarity", "embedding", "reranking")):
+        return "Embeddings"
+    if any(k in t for k in ("robotics", "reinforcement")):
+        return "Agents"
+    if any(k in t for k in ("text", "question-answering", "translation", "summarization", "fill-mask", "token-classification", "zero-shot", "table", "conversational")):
+        return "Text"
+    return "Other"
+
+
+def category_color(task: str) -> QColor:
+    return QColor(CATEGORY_COLORS[task_category(task)])
+
+
+def tint_item(item: QTableWidgetItem, color: QColor) -> None:
+    """Coloured text on a light wash of the same colour; readable on light and dark themes."""
+    wash = QColor(color)
+    wash.setAlpha(48)
+    item.setBackground(wash)
+    item.setForeground(color)
+
 
 @dataclass
 class HubModel:
@@ -1055,6 +1167,11 @@ class HubModel:
     storage: int = 0
     gated: str = ""
     tags: list[str] = field(default_factory=list)
+    local: LocalState = field(default_factory=LocalState)
+
+    @property
+    def category(self) -> str:
+        return task_category(self.task)
 
     @classmethod
     def from_info(cls, info) -> "HubModel":
@@ -1094,15 +1211,17 @@ def fmt_date(d: datetime | None) -> str:
 
 
 class BrowseWorker(QThread):
-    """Pulls one page of models out of a list_models iterator (which paginates lazily)."""
+    """Pulls one page of models out of a list_models iterator (which paginates lazily)
+    and looks each one up on disk."""
 
     page = Signal(list, bool)  # models, more may follow
     failed = Signal(str)
 
-    def __init__(self, iterator, page_size: int, parent=None) -> None:
+    def __init__(self, iterator, page_size: int, opts: Options, parent=None) -> None:
         super().__init__(parent)
         self.iterator = iterator
         self.page_size = page_size
+        self.opts = opts
 
     def run(self) -> None:
         rows: list[HubModel] = []
@@ -1114,7 +1233,25 @@ class BrowseWorker(QThread):
         except Exception as exc:  # noqa: BLE001 - network, auth, bad filter
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return
+        index = LocalIndex(self.opts.dest_path(), self.opts.cache_path(), self.opts.layout)
+        for m in rows:
+            m.local = index.lookup(m.repo_id)
         self.page.emit(rows, len(rows) >= self.page_size)
+
+
+class LocalStateWorker(QThread):
+    """Re-checks which of the listed models are on disk (after a download or a move)."""
+
+    states = Signal(dict)  # repo id -> LocalState
+
+    def __init__(self, repo_ids: list[str], opts: Options, parent=None) -> None:
+        super().__init__(parent)
+        self.repo_ids = repo_ids
+        self.opts = opts
+
+    def run(self) -> None:
+        index = LocalIndex(self.opts.dest_path(), self.opts.cache_path(), self.opts.layout)
+        self.states.emit({repo_id: index.lookup(repo_id) for repo_id in self.repo_ids})
 
 
 class NumItem(QTableWidgetItem):
@@ -1138,6 +1275,7 @@ class NumItem(QTableWidgetItem):
 
 BROWSE_COLUMNS = [
     "Model",
+    "Downloaded",
     "Author",
     "Task",
     "Library",
@@ -1159,9 +1297,11 @@ class BrowseTab(QWidget):
         super().__init__()
         self.window = window
         self.worker: BrowseWorker | None = None
+        self.local_worker: LocalStateWorker | None = None
         self.iterator = None
         self.page_no = 0
         self.models: list[HubModel] = []
+        self.rows: dict[str, int] = {}  # repo id -> table row (the table is re-sorted, so looked up by item)
 
         root = QVBoxLayout(self)
         form = QFormLayout()
@@ -1203,6 +1343,7 @@ class BrowseTab(QWidget):
         self.scrape_btn = QPushButton("Scrape page 1")
         self.scrape_btn.setToolTip("Fetch the first page of the listing with these filters")
         self.scrape_btn.clicked.connect(self.scrape_first)
+        mark(self.scrape_btn, "primary")
         self.next_btn = QPushButton("Next page")
         self.next_btn.setToolTip("Append the next page to the list")
         self.next_btn.clicked.connect(self.scrape_next)
@@ -1214,6 +1355,22 @@ class BrowseTab(QWidget):
         order.addWidget(self.next_btn)
         form.addRow("Pages:", order)
         root.addLayout(form)
+
+        legend = QHBoxLayout()
+        legend.addWidget(QLabel("Categories:"))
+        for name, color in CATEGORY_COLORS.items():
+            chip = QLabel(f"<span style='color:{color}'>&#9632;</span> {name}")
+            chip.setToolTip(f"{name} models: the Task column is coloured like this")
+            legend.addWidget(chip)
+        legend.addSpacing(24)
+        legend.addWidget(QLabel("Downloaded:"))
+        for name, color in LOCAL_COLORS.items():
+            if name == "unverified":
+                continue
+            chip = QLabel(f"<span style='color:{color}'>&#9632;</span> {name}")
+            legend.addWidget(chip)
+        legend.addStretch(1)
+        root.addLayout(legend)
 
         self.table = QTableWidget(0, len(BROWSE_COLUMNS))
         self.table.setHorizontalHeaderLabels(BROWSE_COLUMNS)
@@ -1293,7 +1450,7 @@ class BrowseTab(QWidget):
         self.status.setText(f"Fetching page {self.page_no + 1}...")
         self.scrape_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
-        self.worker = BrowseWorker(self.iterator, self.page_spin.value(), self)
+        self.worker = BrowseWorker(self.iterator, self.page_spin.value(), self.window._options(), self)
         self.worker.page.connect(self._page)
         self.worker.failed.connect(self._failed)
         self.worker.finished.connect(self._worker_finished)
@@ -1319,10 +1476,17 @@ class BrowseTab(QWidget):
         for m in rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
+            local = QTableWidgetItem(m.local.state)
+            self._paint_local(local, m.local)
+            task = QTableWidgetItem(m.task)
+            task.setToolTip(f"{m.category} model")
+            if m.task:
+                tint_item(task, category_color(m.task))
             cells: list[QTableWidgetItem] = [
                 QTableWidgetItem(m.repo_id),
+                local,
                 QTableWidgetItem(m.author),
-                QTableWidgetItem(m.task),
+                task,
                 QTableWidgetItem(m.library),
                 NumItem(fmt_count(m.downloads), m.downloads),
                 NumItem(fmt_count(m.downloads_all), m.downloads_all),
@@ -1340,13 +1504,49 @@ class BrowseTab(QWidget):
                 self.table.setItem(row, col, item)
         self.table.setSortingEnabled(True)
         self.next_btn.setEnabled(more)
+        on_disk = sum(1 for m in self.models if m.local.state)
         text = f"Page {self.page_no}: {len(self.models)} model(s) listed"
+        if on_disk:
+            text += f", {on_disk} already on this machine"
         if not rows:
             text = f"No more models after page {self.page_no - 1} ({len(self.models)} listed)" if self.models else "No model matches these filters."
         elif not more:
             text += ", that is all of them"
         self.status.setText(text)
         self._selection_changed()
+
+    @staticmethod
+    def _paint_local(item: QTableWidgetItem, local: LocalState) -> None:
+        item.setText(local.state)
+        item.setToolTip(local.note)
+        color = LOCAL_COLORS.get(local.state)
+        if color:
+            tint_item(item, QColor(color))
+
+    def refresh_local(self) -> None:
+        """Re-check the Downloaded column after a job (download, move) changed what is on disk."""
+        if not self.models or self.local_worker is not None:
+            return
+        self.local_worker = LocalStateWorker([m.repo_id for m in self.models], self.window._options(), self)
+        self.local_worker.states.connect(self._local_states)
+        self.local_worker.finished.connect(self._local_finished)
+        self.local_worker.start()
+
+    @Slot()
+    def _local_finished(self) -> None:
+        if self.local_worker is not None:
+            self.local_worker.deleteLater()
+        self.local_worker = None
+
+    @Slot(dict)
+    def _local_states(self, states: dict) -> None:
+        for row in range(self.table.rowCount()):
+            m = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            local = states.get(m.repo_id)
+            if local is None:
+                continue
+            m.local = local
+            self._paint_local(self.table.item(row, 1), local)
 
     # -- selection
 
@@ -1578,6 +1778,7 @@ class ModelCardDialog(QDialog):
         buttons = QHBoxLayout()
         self.download_btn = QPushButton("Download")
         self.download_btn.clicked.connect(lambda: self.window.download_repo(self.repo_id))
+        mark(self.download_btn, "primary")
         self.add_btn = QPushButton("Add to list")
         self.add_btn.clicked.connect(lambda: self.window.add_to_list(self.repo_id))
         self.open_btn = QPushButton("Open on huggingface.co")
@@ -1638,7 +1839,7 @@ class ModelCardDialog(QDialog):
         if m is not None:
             parts.append(f"{fmt_count(m.downloads)} downloads last month, {fmt_count(m.downloads_all)} all time, {fmt_count(m.likes)} likes")
             if m.task:
-                parts.append("task " + m.task)
+                parts.append(f"task <b style='color:{category_color(m.task).name()}'>{m.task}</b> ({m.category})")
             if m.library:
                 parts.append("library " + m.library)
             if m.updated:
@@ -1649,6 +1850,10 @@ class ModelCardDialog(QDialog):
                 parts.append("gated: " + m.gated)
         if card.errors:
             parts.extend(card.errors)
+        local = self.window.local_state(card.repo_id)
+        if local.state:
+            color = LOCAL_COLORS.get(local.state, "#5f6368")
+            parts.append(f"<b style='color:{color}'>{local.state}</b>: {local.note}")
         self.stats.setText("; ".join(parts))
         keys = ("license", "base_model", "pipeline_tag", "language", "tags", "datasets", "library_name", "quantized_by")
         meta_bits = [f"<b>{k}</b>: {card.meta[k][:200]}" for k in keys if card.meta.get(k)]
@@ -1744,6 +1949,7 @@ class MainWindow(QMainWindow):
         self.download_btn = QPushButton("Download")
         self.download_btn.setToolTip("Downloads into the hub cache; files that are already complete are skipped, so this also resumes")
         self.download_btn.clicked.connect(self.start_download)
+        mark(self.download_btn, "primary")
         self.resume_btn = QPushButton("Resume")
         self.resume_btn.setToolTip(
             "Pick up a stopped download of this repo: complete files are kept, stale partial files are "
@@ -1780,6 +1986,7 @@ class MainWindow(QMainWindow):
         self.download_all_btn = QPushButton("Download all")
         self.download_all_btn.setToolTip("Download every repo in the list, in order, then verify and move each one")
         self.download_all_btn.clicked.connect(self.start_download_list)
+        mark(self.download_all_btn, "primary")
         self.clear_list_btn = QPushButton("Clear list")
         self.clear_list_btn.clicked.connect(self.list_edit.clear)
         self.list_count = QLabel("")
@@ -1857,8 +2064,10 @@ class MainWindow(QMainWindow):
         self.run_btn.setToolTip("Resume incomplete downloads and move complete models out of the cache")
         self.run_btn.clicked.connect(lambda: self.start_finish(dry_run=False))
         self.run_btn.setDefault(True)
+        mark(self.run_btn, "primary")
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self.stop)
+        mark(self.stop_btn, "danger")
         self.clear_btn = QPushButton("Clear log")
         self.clear_btn.clicked.connect(self.log_view_clear)
         buttons.addWidget(self.scan_btn)
@@ -2037,10 +2246,31 @@ class MainWindow(QMainWindow):
             self.rev_edit.setText(revision)
         self.download_repo(repo_id, self.rev_edit.text().strip())
 
+    def local_state(self, repo_id: str) -> LocalState:
+        opts = self._options()
+        return LocalIndex(opts.dest_path(), opts.cache_path(), opts.layout).lookup(repo_id)
+
+    def _confirm_redownload(self, repo_id: str, local: LocalState) -> bool:
+        """Ask before fetching a model that is already on this machine."""
+        where = str(local.path) if local.path else local.state
+        answer = QMessageBox.question(
+            self,
+            APP_NAME,
+            f"{repo_id} has already been downloaded.\n\nIt is {local.state}:\n{where}\n\n"
+            "Are you sure you want to download it again? Files that are already complete are skipped, "
+            "so this only fetches what changed on the Hub.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def download_repo(self, repo_id: str, revision: str = "") -> None:
         """Download one repo (from the field, the Hub browser or the model card window)."""
         if self.worker is not None:
             QMessageBox.information(self, APP_NAME, "A job is already running. Stop it first, or add the model to the list.")
+            return
+        local = self.local_state(repo_id)
+        if local.downloaded and not self._confirm_redownload(repo_id, local):
             return
         self.show_download_tab()
         self.repo_edit.setText(repo_id)
@@ -2080,6 +2310,32 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_NAME, "A job is already running. Stop it first.")
             return
         opts = self._options()
+        index = LocalIndex(opts.dest_path(), opts.cache_path(), opts.layout)
+        already = [(repo_id, index.lookup(repo_id)) for repo_id, _rev in items]
+        already = [(r, s) for r, s in already if s.downloaded]
+        if already:
+            shown = "\n".join(f"{r}  ({s.state})" for r, s in already[:10])
+            if len(already) > 10:
+                shown += f"\n... and {len(already) - 10} more"
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle(APP_NAME)
+            box.setText(f"{len(already)} of the {len(items)} repo(s) in the list have already been downloaded:\n\n{shown}")
+            box.setInformativeText("Are you sure you want to download them again?")
+            again = box.addButton("Download again", QMessageBox.ButtonRole.YesRole)
+            skip = box.addButton("Skip those", QMessageBox.ButtonRole.NoRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(skip)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is skip:
+                done = {r for r, _s in already}
+                items = [it for it in items if it[0] not in done]
+                if not items:
+                    self.statusBar().showMessage("Everything in the list is already downloaded.", 6000)
+                    return
+            elif clicked is not again:
+                return
         finish_after = self.finish_after_cb.isChecked()
         self._download_ctx = ([repo_id for repo_id, _rev in items], finish_after)
         title = f"downloading {len(items)} repo(s) from the list" + (", each verified and moved" if finish_after else "")
@@ -2233,6 +2489,7 @@ class MainWindow(QMainWindow):
             for repo_id in verify_ctx:
                 self._report_verification(repo_id)
         self.library.refresh()
+        self.browse.refresh_local()
 
     def _report_verification(self, repo_id: str) -> None:
         row = self.rows.get(repo_id)
@@ -2313,7 +2570,11 @@ class MainWindow(QMainWindow):
         item = self.table.item(row, 0)
         item.setText(status)
         color = STATUS_COLORS.get(status)
-        item.setForeground(QColor(color) if color else self.palette().text())
+        if color:
+            tint_item(item, QColor(color))
+        else:
+            item.setForeground(self.palette().text())
+            item.setBackground(self.palette().base())
         if size:
             self.table.item(row, 2).setText(hff.human(size))
         if note or status in ("pending", "checking"):
@@ -2362,10 +2623,40 @@ class MainWindow(QMainWindow):
             self.library.scanner.wait(5000)
         if self.browse.worker is not None:
             self.browse.worker.wait(5000)
+        if self.browse.local_worker is not None:
+            self.browse.local_worker.wait(5000)
         if self.card_dialog is not None:
             self.card_dialog.close()
         self._save_settings()
         event.accept()
+
+
+# --------------------------------------------------------------------------- theme
+
+# Colours on top of the platform style. Base colours come from the palette
+# (palette(...) in the sheet) so the window follows the system's light or
+# dark mode; only the accents are fixed.
+THEME = f"""
+QTabBar::tab {{ padding: 7px 18px; border-bottom: 3px solid transparent; }}
+QTabBar::tab:selected {{ border-bottom: 3px solid {ACCENT}; font-weight: bold; }}
+QTabBar::tab:hover:!selected {{ border-bottom: 3px solid {ACCENT}80; }}
+QGroupBox {{ border: 1px solid palette(mid); border-radius: 6px; margin-top: 12px; padding-top: 6px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {ACCENT}; font-weight: bold; }}
+QProgressBar {{ border: 1px solid palette(mid); border-radius: 4px; text-align: center; height: 20px; }}
+QProgressBar::chunk {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffb347, stop:1 {ACCENT}); border-radius: 3px; }}
+QPushButton[primary="true"] {{ background: {ACCENT}; color: #1f1300; font-weight: bold; border: 1px solid #c97a00; border-radius: 4px; padding: 5px 14px; }}
+QPushButton[primary="true"]:hover {{ background: #ffb347; }}
+QPushButton[primary="true"]:pressed {{ background: #e68d00; }}
+QPushButton[primary="true"]:disabled {{ background: palette(mid); color: palette(dark); border-color: palette(mid); }}
+QPushButton[danger="true"]:enabled {{ color: #c5221f; font-weight: bold; }}
+QHeaderView::section {{ padding: 4px 6px; border: none; border-bottom: 2px solid {ACCENT}; border-right: 1px solid palette(mid); background: palette(button); }}
+QTableWidget {{ gridline-color: palette(midlight); selection-background-color: {ACCENT}55; selection-color: palette(text); }}
+QStatusBar {{ border-top: 2px solid {ACCENT}; }}
+"""
+
+
+def mark(button: QPushButton, role: str) -> None:
+    button.setProperty(role, True)
 
 
 # --------------------------------------------------------------------------- entry point
@@ -2386,6 +2677,7 @@ def main(argv: list[str]) -> int:
     icon_path = resource_path("assets/hf-downloader.ico")
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))
+    app.setStyleSheet(THEME)
     win = MainWindow()
     win.show()
     if "--selftest" in argv:

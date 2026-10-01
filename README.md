@@ -168,6 +168,20 @@ images, the front-matter facts (license, base model, language, tags, ...),
 download, like and task statistics, and the file list with sizes. Nothing of
 this touches the hub cache; the card and its pictures are fetched directly.
 
+The **Downloaded** column says whether a listed model is already on this
+machine: "in library" (a folder with files in the library, in either
+layout), "in cache" (complete in the hub cache), "incomplete",
+"downloading" (another process is fetching it) or "unverified". It is
+checked on disk for every page and again after every job. Asking to download
+a model that is "in library" or "in cache", from any button or from a pasted
+list, brings up a pop-up that says so and asks whether you are sure; for a
+list you can also skip the ones already downloaded. The Task column is
+coloured by **category** (Multimodal, Text, Image, Video, Audio, Embeddings,
+Agents, Other, with a legend above the table), and the model card window
+shows the same colour; the window itself carries the Hugging Face orange as
+accent on tabs, primary buttons, progress bars and table headers, on top of
+the system's light or dark theme.
+
 **Libraries** tab: every model folder in the library (the destination), with
 state, file count, size, last change, details and path; a folder that an
 interrupted move left behind is marked "moving". Models that still sit in the
