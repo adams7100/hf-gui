@@ -32,23 +32,33 @@ Usage:
   hffinish --checksum           hash every file against the Hub first (slow)
 
 Runs with uv (`uv run --script`); without uv, run it with any Python that has
-huggingface_hub>=1.32, e.g. ~/.hf-cli/venv/bin/python hffinish.
+huggingface_hub>=1.32, e.g. ~/.hf-cli/venv/bin/python hffinish. On Windows use
+hffinish.cmd next to this file: it creates a private venv on first run.
 """
 
 from __future__ import annotations
 
 import argparse
 import errno
-import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:  # POSIX: advisory file locks
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
+try:  # Windows: region locks, what huggingface_hub's filelock uses there
+    import msvcrt
+except ImportError:  # POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 from huggingface_hub import HfApi, constants
 from huggingface_hub.hf_api import RepoFile
@@ -57,6 +67,7 @@ DEFAULT_DEST = Path.home() / "models"
 ACTIVE_WINDOW_S = 120  # a partial file written this recently counts as "download in progress"
 STAGING_PREFIX = ".hffinish-partial."
 STORE_SIDE_SUFFIXES = (".refs", ".lock")  # companions of a shared-store blob
+WINDOWS = os.name == "nt"
 
 
 # --------------------------------------------------------------------------- helpers
@@ -95,9 +106,11 @@ def tool_env() -> dict[str, str]:
     """Environment for child processes: PATH without this script's own uv environment,
     so the user's hf (with hf_xet) and hfq are the ones that run."""
     env = os.environ.copy()
-    own = os.path.normpath(os.path.join(sys.prefix, "bin"))
+    own = {os.path.normcase(os.path.normpath(os.path.join(sys.prefix, d))) for d in ("bin", "Scripts")}
     env["PATH"] = os.pathsep.join(
-        p for p in env.get("PATH", "").split(os.pathsep) if p and os.path.normpath(p) != own
+        p
+        for p in env.get("PATH", "").split(os.pathsep)
+        if p and os.path.normcase(os.path.normpath(p)) not in own
     )
     return env
 
@@ -285,35 +298,80 @@ def checksum(repo: Repo, api: HfApi, cache_dir: Path) -> None:
             repo.missing.append(p)
 
 
+def process_cmdlines() -> list[tuple[int, list[str]]]:
+    """(pid, argv) for every process whose command line can be read."""
+    out: list[tuple[int, list[str]]] = []
+    if WINDOWS:
+        query = "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+        try:
+            raw = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", query],
+                stdin=subprocess.DEVNULL,  # a windowed host (HF-Downloader) has no console stdin
+                capture_output=True,
+                text=True,
+                timeout=60,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            ).stdout
+            rows = json.loads(raw) if raw.strip() else []
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return out
+        if isinstance(rows, dict):
+            rows = [rows]
+        for row in rows:
+            cmdline = row.get("CommandLine") or ""
+            if not cmdline:
+                continue
+            try:
+                argv = [a.strip('"') for a in shlex.split(cmdline, posix=False)]
+            except ValueError:
+                argv = cmdline.split()
+            out.append((int(row.get("ProcessId") or 0), argv))
+        return out
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            argv = [a.decode(errors="replace") for a in (proc / "cmdline").read_bytes().split(b"\0") if a]
+        except OSError:
+            continue
+        out.append((int(proc.name), argv))
+    return out
+
+
+def lock_is_held(lock: Path) -> bool:
+    """True when another process holds huggingface_hub's per-file download lock."""
+    try:
+        fd = os.open(lock, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except (BlockingIOError, PermissionError):
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
 def active_reason(repo: Repo, cache_dir: Path) -> str | None:
     """Why this repo must not be touched right now, or None."""
     # 1. some process has the repo id on its command line (hf download, hfq, ...)
     mine = {os.getpid(), os.getppid()}
     want = repo.repo_id.lower()
-    for proc in Path("/proc").glob("[0-9]*"):
-        if int(proc.name) in mine:
+    for pid, argv in process_cmdlines():
+        if pid in mine:
             continue
-        try:
-            argv = [a.decode(errors="replace") for a in (proc / "cmdline").read_bytes().split(b"\0") if a]
-        except OSError:
-            continue
-        if any("hffinish" in a for a in argv):
+        if any("hffinish" in a.lower() for a in argv):
             continue
         if any(a.lower() == want for a in argv):
-            shown = " ".join(os.path.basename(a) if a.startswith("/") else a for a in argv)
-            return f"pid {proc.name}: {shown[:70]}"
+            shown = " ".join(os.path.basename(a) if os.path.isabs(a) else a for a in argv)
+            return f"pid {pid}: {shown[:70]}"
     # 2. a per-file download lock is held
     for lock in (cache_dir / ".locks" / repo.info.repo_path.name).glob("*.lock"):
-        try:
-            fd = os.open(lock, os.O_RDWR)
-        except OSError:
-            continue
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if lock_is_held(lock):
             return f"download lock held ({lock.name[:10]}...)"
-        finally:
-            os.close(fd)
     # 3. a partial file was written moments ago
     now = time.time()
     for part in (repo.info.repo_path / "blobs").glob("*.incomplete"):
@@ -392,6 +450,15 @@ def resume(repo: Repo, args: argparse.Namespace, cache_dir: Path) -> int:
             log(repo, f"download failed: {exc}")
             return 1
     log(repo, "running: " + " ".join(cmd))
+    return run_download(repo, cmd, env)
+
+
+def run_download(repo: Repo, cmd: list[str], env: dict[str, str]) -> int:
+    """Run the download command and return its exit code.
+
+    Module-level on purpose: HF-Downloader (the Qt front end) replaces this,
+    like `log`, to stream the command's output into its window.
+    """
     return subprocess.call(cmd, env=env)
 
 
