@@ -19,6 +19,19 @@ For every model in the hub cache (`~/.cache/huggingface/hub` by default) it:
 A repo that another process is downloading right now is left alone. Pass
 `--wait` to wait for it and move it when the download ends.
 
+## Download
+
+| Installer | Version | Size | SHA-256 |
+| --- | --- | --- | --- |
+| [`HF-Downloader-setup-1.2.0.exe`](https://github.com/adams7100/hf-gui/releases) | 1.2.0 | 56 MB | `8c0b96f2e2a908b4b265f851332958250a03a563defc872762c20d6581c7d283` |
+
+Windows 10/11, 64-bit, no Python needed. Installers are attached to the
+[Releases](https://github.com/adams7100/hf-gui/releases) page; each one is
+built from the tagged commit with `build-installer.cmd` (see
+[Installer](#installer)) and installs per user without an admin prompt. The
+file is unsigned, so SmartScreen may warn once; choose "More info" and "Run
+anyway".
+
 ## Requirements
 
 - [`uv`](https://docs.astral.sh/uv/): the script declares its own dependency
@@ -331,8 +344,8 @@ JRSoftware.InnoSetup`). It runs `build-exe.cmd` first, then compiles
 `installer.iss`:
 
 ```bat
-build-installer.cmd            :: dist\HF-Downloader-setup-1.0.0.exe
-build-installer.cmd 1.2.0      :: another version number
+build-installer.cmd            :: dist\HF-Downloader-setup-1.2.0.exe
+build-installer.cmd 1.3.0      :: another version number
 ```
 
 The installer puts `HF-Downloader.exe` (with its `_internal\` folder),
@@ -350,7 +363,7 @@ Open a **new** terminal after installing: terminals that were already open
 keep their old PATH and will not find `hffinish`. Silent install:
 
 ```bat
-HF-Downloader-setup-1.0.0.exe /VERYSILENT /NORESTART
+HF-Downloader-setup-1.2.0.exe /VERYSILENT /NORESTART
 ```
 
 The installer is unsigned, like the exe, so SmartScreen may warn once
