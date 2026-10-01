@@ -198,7 +198,10 @@ dates numerically. Several rows can be selected at once (Ctrl-click, Shift-click
 page): "Download" queues every selected model on the Download tab (asking
 first about the ones already downloaded), "Add to list" appends them all to
 the list there, "Open on huggingface.co" opens a tab for each. "View details"
-(or a double click) opens the model card window for the first selected one: the whole README rendered with its
+(or a double click) opens the model card window for the first selected one;
+while that window is open it follows the selection, switching to whichever
+model you select next (in the Hub browser, or a cached model on the
+Libraries tab) without taking the focus away from the table: the whole README rendered with its
 images, the front-matter facts (license, base model, language, tags, ...),
 download, like and task statistics, and the file list with sizes. Nothing of
 this touches the hub cache; the card and its pictures are fetched directly.

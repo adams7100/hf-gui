@@ -1293,6 +1293,7 @@ class LibraryTab(QWidget):
         self.open_model_btn.setEnabled(e is not None)
         self.verify_btn.setEnabled(e is not None and e.in_cache)
         self.resume_btn.setEnabled(e is not None and e.in_cache and e.state not in ("in cache", "downloading"))
+        self.window.follow_selection(e.repo_id if e is not None and e.in_cache else None)
 
     def _open_selected(self) -> None:
         e = self._selected()
@@ -1900,6 +1901,7 @@ class BrowseTab(QWidget):
         self.download_btn.setText(f"Download {n} models" if n > 1 else "Download")
         self.add_btn.setText(f"Add {n} to list" if n > 1 else "Add to list")
         self.selection_label.setText(f"{n} selected" if n > 1 else "")
+        self.window.follow_selection(models[0].repo_id if models else None)
 
     def _details(self) -> None:
         m = self.selected()
@@ -2152,7 +2154,11 @@ class ModelCardDialog(QDialog):
         split.setStretchFactor(1, 4)
         root.addWidget(split, 1)
 
-    def load(self, repo_id: str) -> None:
+    def load(self, repo_id: str, raise_window: bool = True) -> None:
+        """Show this model's card. With raise_window=False the window just follows along
+        (the user is selecting rows elsewhere and keeps the focus there)."""
+        if repo_id == self.repo_id and self.worker is not None:
+            return  # already loading it
         self.repo_id = repo_id
         self.setWindowTitle(f"{repo_id} - model card")
         self.title.setText(repo_id)
@@ -2168,8 +2174,9 @@ class ModelCardDialog(QDialog):
         self.worker.finished.connect(self.worker.deleteLater)
         self.worker.start()
         self.show()
-        self.raise_()
-        self.activateWindow()
+        if raise_window:
+            self.raise_()
+            self.activateWindow()
 
     @Slot(object)
     def _ready(self, card: ModelCard) -> None:
@@ -2355,6 +2362,11 @@ class MainWindow(QMainWindow):
         self.ext_bridge = _Bridge(self)
         self.ext_bridge.transfer.connect(self._on_transfer)
         self.transfer_rows: dict[str, TransferRow] = {}
+        self._follow_repo = ""  # the model the open card window should switch to
+        self._follow_timer = QTimer(self)
+        self._follow_timer.setSingleShot(True)
+        self._follow_timer.setInterval(250)  # let a Shift-drag settle before reloading the card
+        self._follow_timer.timeout.connect(self._follow_fire)
         self._build_ui()
         self._build_menu()
         self._load_settings()
@@ -2961,6 +2973,20 @@ class MainWindow(QMainWindow):
         if self.card_dialog is None:
             self.card_dialog = ModelCardDialog(self)
         self.card_dialog.load(repo_id)
+
+    def follow_selection(self, repo_id: str | None) -> None:
+        """Selected another model while the card window is open: the window switches to it."""
+        dlg = self.card_dialog
+        if not repo_id or dlg is None or not dlg.isVisible() or dlg.repo_id == repo_id:
+            return
+        self._follow_repo = repo_id
+        self._follow_timer.start()
+
+    @Slot()
+    def _follow_fire(self) -> None:
+        dlg = self.card_dialog
+        if dlg is not None and dlg.isVisible() and self._follow_repo and dlg.repo_id != self._follow_repo:
+            dlg.load(self._follow_repo, raise_window=False)
 
     def start_finish(self, dry_run: bool, title: str = "") -> None:
         """A pass over the whole cache: runs alone."""
