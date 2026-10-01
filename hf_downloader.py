@@ -255,7 +255,9 @@ class Transfer:
 
 
 STALL_WARN_S = 20  # heartbeat: no bytes for this long is shown as a warning
-STALL_ALARM_S = 90  # ... and for this long as a stall
+STALL_ALARM_S = 90  # ... and for this long as a stall: our own downloads are restarted at this point
+MAX_FAILED_RESTARTS = 5  # a download that keeps exiting with an error (not a stall) is given up after this many
+MAX_CHECKSUM_ROUNDS = 3  # files whose hash does not match are fetched again, this many times at most
 
 
 def heartbeat_text(t: "Transfer") -> tuple[str, str]:
@@ -361,6 +363,7 @@ class TransferMeter(threading.Thread):
         alive=None,  # callable -> bool; the meter ends by itself once it returns False
         external: bool = False,
         pid: int = 0,
+        on_stall=None,  # callable(seconds) fired once when no byte has landed for STALL_ALARM_S
     ) -> None:
         super().__init__(daemon=True, name="transfer-meter")
         self.emit = emit
@@ -371,6 +374,7 @@ class TransferMeter(threading.Thread):
         self.alive = alive
         self.external = external
         self.pid = pid
+        self.on_stall = on_stall
         self._stop = threading.Event()
         self._final_on_stop = True
 
@@ -424,6 +428,7 @@ class TransferMeter(threading.Thread):
         speed = 0.0
         alive = True
         total = 0
+        stall_fired = False
         no_net = -1.0 if net is None else 0.0
         self._emit(self._reading(last, total, 0.0, no_net, no_net, 0.0, alive))
         if callable(self.expected):
@@ -439,6 +444,13 @@ class TransferMeter(threading.Thread):
             dt = max(now - last_t, 1e-3)
             if cur != last:
                 changed_t = now
+                stall_fired = False
+            elif self.on_stall is not None and not stall_fired and now - changed_t >= STALL_ALARM_S:
+                stall_fired = True
+                try:
+                    self.on_stall(now - changed_t)
+                except Exception:  # noqa: BLE001 - the watchdog must never kill the meter
+                    pass
             inst = max(cur - last, 0) / dt
             speed = inst if speed == 0 else 0.7 * speed + 0.3 * inst
             if now - changed_t >= 3:
@@ -460,6 +472,191 @@ class TransferMeter(threading.Thread):
                 break
         if not alive or self._final_on_stop:
             self._emit(self._reading(self.measure(), total, 0.0, -1.0, -1.0, 0.0, alive, final=True))
+
+
+def remove_stale_partials(repo_id: str, cache_dir: Path) -> int:
+    """Drop *.incomplete leftovers of a download we just ended; the next run never appends to them."""
+    freed = 0
+    blobs = cache_dir / f"models--{repo_id.replace('/', '--')}" / "blobs"
+    for part in blobs.glob("*.incomplete"):
+        try:
+            freed += part.stat().st_size
+            part.unlink()
+        except OSError:
+            pass
+    return freed
+
+
+# --------------------------------------------------------------------------- checksums
+
+
+@dataclass
+class FileCheck:
+    path: str
+    size: int
+    algo: str  # "sha256" (LFS files) or "git-sha1" (small files stored in git)
+    expected: str  # from the Hub, before the download
+    after_download: str = ""  # hashed in the cache once the download finished
+    after_move: str = ""  # hashed again in the library after the move
+    note: str = ""
+
+    def stage_ok(self, stage: str) -> bool | None:
+        """True/False when that stage was hashed, None when it was not."""
+        got = getattr(self, stage)
+        if not got or not self.expected:
+            return None
+        return got == self.expected
+
+
+@dataclass
+class ChecksumReport:
+    repo_id: str
+    commit: str = ""
+    files: list[FileCheck] = field(default_factory=list)
+    notes: dict[str, str] = field(default_factory=dict)  # stage -> what happened (errors, "not moved", ...)
+    rounds: int = 0  # how many times mismatching files had to be fetched again
+    restarts: int = 0  # how many times the download itself was restarted (stalls, exits)
+
+    def stage_counts(self, stage: str) -> tuple[int, int, int]:
+        """(matching, mismatching, not hashed) for a stage."""
+        ok = bad = none = 0
+        for f in self.files:
+            r = f.stage_ok(stage)
+            if r is None:
+                none += 1
+            elif r:
+                ok += 1
+            else:
+                bad += 1
+        return ok, bad, none
+
+    def stage_verdict(self, stage: str) -> tuple[bool | None, str]:
+        label = {"expected": "1. Before download: checksums from the Hub", "after_download": "2. After download: files hashed in the cache", "after_move": "3. After move: files hashed in the library"}[stage]
+        if stage == "expected":
+            known = sum(1 for f in self.files if f.expected)
+            if not self.files:
+                return None, f"{label}: {self.notes.get('expected', 'no file list')}"
+            return (known == len(self.files)), f"{label}: {known} of {len(self.files)} files have a checksum on the Hub"
+        ok, bad, none = self.stage_counts(stage)
+        note = self.notes.get(stage, "")
+        if note and not ok and not bad:
+            return None, f"{label}: {note}"
+        text = f"{label}: {ok} match"
+        if bad:
+            text += f", {bad} MISMATCH"
+        if none:
+            text += f", {none} not hashed"
+        if note:
+            text += f" ({note})"
+        return (bad == 0 and ok > 0), text
+
+    @property
+    def all_ok(self) -> bool:
+        return all(self.stage_verdict(s)[0] for s in ("expected", "after_download", "after_move"))
+
+
+def expected_checksums(repo_id: str, revision: str) -> tuple[str, list[FileCheck]]:
+    """The Hub's checksums for every file at that revision: sha256 for LFS files, git blob sha1 otherwise."""
+    api = hff.HfApi()
+    info = api.model_info(repo_id, revision=revision or None)
+    commit = info.sha or ""
+    files: list[FileCheck] = []
+    for entry in api.list_repo_tree(repo_id, revision=commit or revision or None, recursive=True, expand=True):
+        if not isinstance(entry, hff.RepoFile):
+            continue
+        lfs = getattr(entry, "lfs", None)
+        if lfs is not None and getattr(lfs, "sha256", None):
+            files.append(FileCheck(entry.path, int(entry.size), "sha256", lfs.sha256.lower()))
+        else:
+            files.append(FileCheck(entry.path, int(entry.size), "git-sha1", (getattr(entry, "blob_id", "") or "").lower()))
+    files.sort(key=lambda f: f.path.lower())
+    return commit, files
+
+
+def hash_file(path: Path, algo: str, size: int, progress=None) -> str:
+    import hashlib
+
+    if algo == "git-sha1":
+        h = hashlib.sha1()
+        h.update(b"blob %d\0" % size)
+    else:
+        h = hashlib.sha256()
+    done = 0
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(8 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+            done += len(chunk)
+            if progress is not None:
+                progress(done)
+    return h.hexdigest()
+
+
+def hash_tree(root: Path, files: list[FileCheck], stage: str, w: "Worker", repo_id: str) -> list[FileCheck]:
+    """Hash every file under root into the given stage of the report; returns the mismatching ones."""
+    bad: list[FileCheck] = []
+    total = sum(f.size for f in files)
+    done_total = 0
+    for n, f in enumerate(files, 1):
+        if w.cancelled:
+            raise KeyboardInterrupt
+        p = root / f.path
+        label = f"hashing {n}/{len(files)} {f.path}"
+        w.repo_update.emit(repo_id, "verifying", label, None)
+        if not p.is_file():
+            f.note = f"{stage}: file missing"
+            setattr(f, stage, "missing")
+            bad.append(f)
+            continue
+        try:
+            start = done_total
+
+            def prog(b: int, start=start) -> None:
+                w.progress.emit(f"{repo_id}: {label}  {hff.human(start + b)} / {hff.human(total)}")
+
+            digest = hash_file(p, f.algo, f.size, prog)
+        except OSError as exc:
+            digest = "unreadable"
+            f.note = f"{stage}: {exc}"
+        setattr(f, stage, digest)
+        done_total += f.size
+        mark_ok = f.stage_ok(stage)
+        tick = "OK" if mark_ok else ("??" if mark_ok is None else "MISMATCH")
+        w.line.emit(f"{f.algo} {f.path}: hub={f.expected[:16] or '-'}  {stage.replace('_', ' ')}={digest[:16]}  {tick}")
+        if mark_ok is False:
+            bad.append(f)
+    w.progress.emit("")
+    return bad
+
+
+def drop_cached_files(repo_id: str, cache_dir: Path, snapshot: Path, files: list[FileCheck]) -> None:
+    """Remove mismatching files (pointer and blob) so the next download fetches them again."""
+    for f in files:
+        chain = hff.link_chain(snapshot / f.path)
+        for p in chain:
+            try:
+                if p.is_symlink() or p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
+        if chain:
+            hff.remove_store_side_files(chain[-1], cache_dir)
+
+
+def cached_snapshot(repo_id: str, cache_dir: Path, commit: str) -> Path | None:
+    repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
+    if commit and (repo_dir / "snapshots" / commit).is_dir():
+        return repo_dir / "snapshots" / commit
+    try:
+        ref = (repo_dir / "refs" / "main").read_text().strip()
+        if (repo_dir / "snapshots" / ref).is_dir():
+            return repo_dir / "snapshots" / ref
+    except OSError:
+        pass
+    snaps = sorted((repo_dir / "snapshots").glob("*"), key=lambda p: p.stat().st_mtime, reverse=True) if (repo_dir / "snapshots").is_dir() else []
+    return snaps[0] if snaps else None
 
 
 def cached_expected_size(repo_id: str, cache_dir: Path) -> int:
@@ -680,6 +877,7 @@ class Worker(QThread):
     repo_update = Signal(str, str, str, object)  # repo id, status, note, total bytes or None
     transfer = Signal(object)  # a Transfer reading of the running download
     external = Signal(str, str)  # repo id, reason: another process is downloading this repo
+    checksums = Signal(object)  # a ChecksumReport once a download is complete and verified
     done = Signal(int)  # exit code
 
     def __init__(self, job, cache_dir: Path, parent=None) -> None:
@@ -691,7 +889,9 @@ class Worker(QThread):
         self.ctx: tuple | None = None  # ("download", repo_ids, finish_after) or ("verify", repo_ids)
         self.current_repo = ""  # repo whose download the meter is measuring right now
         self.rc: int | None = None
+        self.restarts = 0  # how often this job's download had to be restarted
         self._cancel = threading.Event()
+        self._stall_restart = False  # the heartbeat killed the download because it stalled
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._meter: TransferMeter | None = None
@@ -721,6 +921,7 @@ class Worker(QThread):
             self.cache_dir,
             expected or (lambda: cached_expected_size(repo_id, self.cache_dir)),
             alive=self._download_alive,
+            on_stall=self._on_stall,
         )
         self._meter.start()
 
@@ -730,6 +931,63 @@ class Worker(QThread):
         with self._lock:
             proc = self._proc
         return proc is None or proc.poll() is None
+
+    def _on_stall(self, stalled: float) -> None:
+        """Heartbeat watchdog (meter thread): nothing landed for STALL_ALARM_S, so end the
+        download command; run_with_restarts then starts it again."""
+        with self._lock:
+            proc = self._proc
+        if proc is None or proc.poll() is not None or self.cancelled:
+            return
+        self._stall_restart = True
+        self.line.emit(f"heartbeat: no data for {int(stalled)} s, restarting the download")
+        kill_tree(proc)
+
+    def _sleep(self, seconds: float) -> None:
+        """Wait between restarts, but wake up at once when cancelled."""
+        if self._cancel.wait(seconds):
+            raise KeyboardInterrupt
+
+    def run_with_restarts(self, repo_id: str, cmd: list[str], env: dict[str, str], expected: int) -> int:
+        """Run a download command until it succeeds.
+
+        A stall (no bytes for STALL_ALARM_S) ends the command and starts it again
+        as often as needed; an exit with an error is retried MAX_FAILED_RESTARTS
+        times. Complete files are skipped by the downloader, stale partial files
+        are dropped first, and the wait between attempts grows from 5 s to 60 s.
+        """
+        attempt = 0
+        failures = 0
+        while True:
+            self._stall_restart = False
+            self.start_meter(repo_id, expected)
+            try:
+                rc = self.stream(cmd, env)
+            finally:
+                self.stop_meter()
+            if rc == 0:
+                return 0
+            if self.cancelled:
+                raise KeyboardInterrupt
+            if self._stall_restart:
+                why = "stalled"
+            else:
+                failures += 1
+                why = f"exited with code {rc}"
+                if failures > MAX_FAILED_RESTARTS:
+                    self.line.emit(f"{repo_id}: download {why} {failures} times, giving up (Resume tries again)")
+                    return rc
+            attempt += 1
+            self.restarts += 1
+            wait = min(5 * 2 ** min(attempt - 1, 4), 60)
+            freed = remove_stale_partials(repo_id, self.cache_dir)
+            note = f"{why}; restart {attempt} in {wait} s"
+            if freed:
+                note += f", {hff.human(freed)} of partial files dropped"
+            self.line.emit(f"{repo_id}: download {note} (complete files are kept)")
+            self.repo_update.emit(repo_id, "restarting", note, None)
+            self._sleep(wait)
+            self.repo_update.emit(repo_id, "downloading", f"restart {attempt}", None)
 
     def stop_meter(self) -> None:
         if self._meter is not None:
@@ -782,13 +1040,10 @@ class Worker(QThread):
             self.repo_update.emit(repo.repo_id, repo.status or "checked", repo.note, repo.total_bytes or None)
 
     def _run_download(self, repo, cmd: list[str], env: dict[str, str]) -> int:
-        if repo is not None:
-            self.repo_update.emit(repo.repo_id, "downloading", os.path.basename(cmd[0]), repo.total_bytes or None)
-            self.start_meter(repo.repo_id, repo.total_bytes)
-        try:
+        if repo is None:
             return self.stream(cmd, env)
-        finally:
-            self.stop_meter()
+        self.repo_update.emit(repo.repo_id, "downloading", os.path.basename(cmd[0]), repo.total_bytes or None)
+        return self.run_with_restarts(repo.repo_id, cmd, env, repo.total_bytes)
 
     # -- helpers for jobs
 
@@ -850,53 +1105,130 @@ def finish_job(opts: Options):
     return job
 
 
-def _download_one(w: Worker, repo_id: str, revision: str, opts: Options, finish_after: bool) -> int:
-    """Download one repo into the cache (with the meter running), then optionally finish it."""
-    w.repo_update.emit(repo_id, "downloading", "asking the Hub for the file list", None)
-    expected = expected_size(repo_id, revision)
-    if expected:
-        w.line.emit(f"{repo_id}: {hff.human(expected)} at {revision or 'main'}")
-    w.repo_update.emit(repo_id, "downloading", "", expected or None)
+def _fetch(w: Worker, repo_id: str, revision: str, opts: Options, expected: int, resume: bool) -> int:
+    """Get the repo's files into the cache: `hf download` (restarted as needed) or, for a
+    repo already in the cache, hffinish's resume pass without the move."""
+    if resume:
+        fin = Options(**{**opts.__dict__, "filters": [repo_id], "no_move": True, "no_download": False, "dry_run": False, "checksum": False})
+        w.line.emit("resuming: hffinish " + " ".join(fin.argv()))
+        return hff.main(fin.argv())
     env = hff.tool_env()
     hf = shutil.which("hf", path=env["PATH"]) or shutil.which("hf")
+    if hf:
+        cmd = [hf, "download", repo_id]
+        if revision:
+            cmd += ["--revision", revision]
+        if opts.cache_dir:
+            cmd += ["--cache-dir", opts.cache_dir]
+        w.line.emit("running: " + " ".join(cmd))
+        return w.run_with_restarts(repo_id, cmd, env, expected)
+    from huggingface_hub import snapshot_download
+
+    w.line.emit("hf CLI not found on PATH, downloading in-process (cannot be stopped midway)")
     w.start_meter(repo_id, expected)
     try:
-        if hf:
-            cmd = [hf, "download", repo_id]
-            if revision:
-                cmd += ["--revision", revision]
-            if opts.cache_dir:
-                cmd += ["--cache-dir", opts.cache_dir]
-            w.line.emit("running: " + " ".join(cmd))
-            rc = w.stream(cmd, env)
-        else:
-            from huggingface_hub import snapshot_download
-
-            w.line.emit("hf CLI not found on PATH, downloading in-process (cannot be stopped midway)")
-            try:
-                snapshot_download(repo_id, revision=revision or None, cache_dir=opts.cache_dir or None)
-                rc = 0
-            except Exception as exc:  # noqa: BLE001
-                w.line.emit(f"download failed: {exc}")
-                rc = 1
+        snapshot_download(repo_id, revision=revision or None, cache_dir=opts.cache_dir or None)
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        w.line.emit(f"download failed: {exc}")
+        return 1
     finally:
         w.stop_meter()
-    if rc != 0:
-        w.repo_update.emit(repo_id, "error", f"download exited with code {rc}", None)
-        return rc
-    w.repo_update.emit(repo_id, "downloaded", "in the cache", None)
-    if not finish_after:
-        return 0
-    w.line.emit("")
-    return hff.main(opts.argv(filters=[repo_id]))
 
 
-def download_job(repo_id: str, revision: str, opts: Options, finish_after: bool):
-    """Download one repo into the cache, then optionally run the finish pass on it."""
+def download_job(repo_id: str, revision: str, opts: Options, finish_after: bool, resume: bool = False):
+    """Download (or resume) one repo and verify it three times over.
+
+    1. before: the Hub's checksums for every file at the revision,
+    2. after the download: every file hashed in the cache; mismatching files are
+       dropped and fetched again (up to MAX_CHECKSUM_ROUNDS),
+    3. after the move: every file hashed again in the library.
+    The report goes to the window, which shows it in a pop-up.
+    """
 
     def job(w: Worker) -> int:
         w.repos_found.emit([repo_id])
-        return _download_one(w, repo_id, revision, opts, finish_after)
+        report = ChecksumReport(repo_id)
+        cache = opts.cache_path()
+
+        # 1. what the Hub says every file should hash to
+        w.repo_update.emit(repo_id, "checking", "asking the Hub for the file list and checksums", None)
+        try:
+            report.commit, report.files = expected_checksums(repo_id, revision)
+            known = sum(1 for f in report.files if f.expected)
+            w.line.emit(
+                f"{repo_id}: {len(report.files)} files, {hff.human(sum(f.size for f in report.files))} at "
+                f"{report.commit[:12] or revision or 'main'}; checksums known for {known} (before download)"
+            )
+            for f in report.files:
+                w.line.emit(f"  expected {f.algo} {f.path}: {f.expected or '-'}")
+        except Exception as exc:  # noqa: BLE001 - offline, gated, typo
+            report.notes["expected"] = f"could not get the file list: {type(exc).__name__}: {exc}"
+            w.line.emit(f"{repo_id}: {report.notes['expected']}")
+        expected_bytes = sum(f.size for f in report.files)
+        w.repo_update.emit(repo_id, "downloading", "", expected_bytes or None)
+
+        # 2. download, hash in the cache, fetch mismatching files again
+        rc = 1
+        for round_no in range(1, MAX_CHECKSUM_ROUNDS + 1):
+            rc = _fetch(w, repo_id, revision, opts, expected_bytes, resume and round_no == 1)
+            if rc != 0:
+                w.repo_update.emit(repo_id, "error", f"download exited with code {rc}", None)
+                report.notes["after_download"] = f"download did not finish (exit {rc})"
+                report.restarts = w.restarts
+                w.checksums.emit(report)
+                return rc
+            snapshot = cached_snapshot(repo_id, cache, report.commit)
+            if snapshot is None:
+                report.notes["after_download"] = "no snapshot in the cache"
+                break
+            if not report.files:
+                report.notes["after_download"] = "nothing to compare against"
+                break
+            w.line.emit(f"{repo_id}: download complete, hashing {len(report.files)} files in the cache (after download)")
+            bad = hash_tree(snapshot, report.files, "after_download", w, repo_id)
+            if not bad:
+                w.line.emit(f"{repo_id}: all {len(report.files)} files match the Hub's checksums")
+                break
+            report.rounds = round_no
+            names = ", ".join(f.path for f in bad[:5]) + (" ..." if len(bad) > 5 else "")
+            if round_no == MAX_CHECKSUM_ROUNDS:
+                report.notes["after_download"] = f"{len(bad)} file(s) still wrong after {round_no} downloads: {names}"
+                w.line.emit(f"{repo_id}: {report.notes['after_download']}")
+                w.repo_update.emit(repo_id, "error", report.notes["after_download"], None)
+                report.restarts = w.restarts
+                w.checksums.emit(report)
+                return 1
+            w.line.emit(f"{repo_id}: {len(bad)} file(s) do not match ({names}); dropping them and downloading again")
+            drop_cached_files(repo_id, cache, snapshot, bad)
+        w.repo_update.emit(repo_id, "downloaded", "in the cache, checksums verified", None)
+        report.restarts = w.restarts
+
+        # 3. move to the library and hash once more there
+        if not finish_after:
+            report.notes["after_move"] = "left in the cache (not moved)"
+            w.checksums.emit(report)
+            return 0
+        w.line.emit("")
+        fin = Options(**{**opts.__dict__, "filters": [repo_id], "checksum": False})  # hashed a moment ago
+        rc = hff.main(fin.argv())
+        snap_before = cached_snapshot(repo_id, cache, report.commit)
+        dest = opts.dest_path() / (repo_id if opts.layout == "nested" else repo_id.split("/")[-1])
+        if snap_before is None and dest.is_dir() and report.files:
+            w.line.emit(f"{repo_id}: moved, hashing {len(report.files)} files in the library (after move)")
+            bad = hash_tree(dest, report.files, "after_move", w, repo_id)
+            if bad:
+                report.notes["after_move"] = f"{len(bad)} file(s) differ after the move"
+                w.repo_update.emit(repo_id, "error", report.notes["after_move"], None)
+                rc = 1
+            else:
+                w.line.emit(f"{repo_id}: all {len(report.files)} files still match in the library")
+        elif rc != 0 or snap_before is not None:
+            report.notes["after_move"] = "not moved (see the log)"
+        else:
+            report.notes["after_move"] = "nothing to compare against"
+        w.checksums.emit(report)
+        return rc
 
     return job
 
@@ -2338,6 +2670,92 @@ class TransferRow(QWidget):
         return None
 
 
+class ChecksumDialog(QDialog):
+    """The pop-up at the end of a download: the three checksum stages, then every file's hashes."""
+
+    def __init__(self, report: ChecksumReport, parent=None) -> None:
+        super().__init__(parent)
+        self.report = report
+        self.setWindowTitle(f"{report.repo_id}: {'verified' if report.all_ok else 'verification'}")
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.resize(900, 560)
+        root = QVBoxLayout(self)
+        title = QLabel(
+            f"<b>{report.repo_id}</b>" + (f" @ {report.commit[:12]}" if report.commit else "")
+            + (": <span style='color:#1e8e3e'>complete, all three checksum stages match</span>" if report.all_ok else ": <span style='color:#c5221f'>not fully verified</span>")
+        )
+        title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(title)
+        for stage in ("expected", "after_download", "after_move"):
+            ok, text = report.stage_verdict(stage)
+            mark_txt = "&#10004;" if ok else ("&#8212;" if ok is None else "&#10008;")
+            color = "#1e8e3e" if ok else ("#5f6368" if ok is None else "#c5221f")
+            lab = QLabel(f"<span style='color:{color}; font-size: 14pt'>{mark_txt}</span> {text}")
+            lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            root.addWidget(lab)
+        extra = []
+        if report.restarts:
+            extra.append(f"the download was restarted {report.restarts} time(s) by the heartbeat")
+        if report.rounds:
+            extra.append(f"mismatching files were fetched again {report.rounds} time(s)")
+        if extra:
+            root.addWidget(QLabel("; ".join(extra)))
+
+        table = QTableWidget(len(report.files), 6)
+        table.setHorizontalHeaderLabels(["File", "Size", "Algorithm", "1. Hub (before)", "2. After download", "3. After move"])
+        hdr = table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, 6):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(True)
+        table.setSortingEnabled(False)
+        for row, f in enumerate(report.files):
+            table.setItem(row, 0, QTableWidgetItem(f.path))
+            table.setItem(row, 1, NumItem(hff.human(f.size), f.size))
+            table.setItem(row, 2, QTableWidgetItem(f.algo))
+            exp = QTableWidgetItem(f.expected[:20] + ("…" if len(f.expected) > 20 else "") if f.expected else "-")
+            exp.setToolTip(f.expected)
+            table.setItem(row, 3, exp)
+            for col, stage in ((4, "after_download"), (5, "after_move")):
+                got = getattr(f, stage)
+                item = QTableWidgetItem((got[:20] + ("…" if len(got) > 20 else "")) if got else "-")
+                item.setToolTip(got + (f"\n{f.note}" if f.note else ""))
+                verdict = f.stage_ok(stage)
+                if verdict is True:
+                    tint_item(item, QColor("#1e8e3e"))
+                elif verdict is False:
+                    tint_item(item, QColor("#c5221f"))
+                table.setItem(row, col, item)
+        table.setSortingEnabled(True)
+        root.addWidget(table, 1)
+
+        buttons = QHBoxLayout()
+        copy_btn = QPushButton("Copy report")
+        copy_btn.clicked.connect(self._copy)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        mark(close_btn, "primary")
+        buttons.addWidget(copy_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        root.addLayout(buttons)
+
+    def _copy(self) -> None:
+        r = self.report
+        lines = [f"{r.repo_id} @ {r.commit}"]
+        for stage in ("expected", "after_download", "after_move"):
+            ok, text = r.stage_verdict(stage)
+            lines.append(("OK   " if ok else ("--   " if ok is None else "FAIL ")) + text)
+        lines.append("")
+        for f in r.files:
+            lines.append(f"{f.algo}\t{f.path}\t{f.expected or '-'}\t{f.after_download or '-'}\t{f.after_move or '-'}\t{f.note}")
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusTip = "copied"
+
+
 class _Bridge(QObject):
     """Carries meter readings from a plain thread into the GUI thread."""
 
@@ -2362,6 +2780,7 @@ class MainWindow(QMainWindow):
         self.ext_bridge = _Bridge(self)
         self.ext_bridge.transfer.connect(self._on_transfer)
         self.transfer_rows: dict[str, TransferRow] = {}
+        self.checksum_dialogs: list[QDialog] = []  # open verification pop-ups
         self._follow_repo = ""  # the model the open card window should switch to
         self._follow_timer = QTimer(self)
         self._follow_timer.setSingleShot(True)
@@ -2820,18 +3239,16 @@ class MainWindow(QMainWindow):
             finish_after = self.finish_after_cb.isChecked()
             repo_dir = opts.cache_path() / f"models--{item.repo_id.replace('/', '--')}"
             if item.mode == "resume" and (repo_dir / "snapshots").is_dir():
-                # pick a cached, unfinished repo up: a finish pass limited to it (stale partials
-                # dropped, missing files fetched at the cached commit, then verify and move)
-                opts.filters = [item.repo_id]
-                opts.no_download = False
-                opts.dry_run = False
+                # pick a cached, unfinished repo up: hffinish's resume pass limited to it (stale
+                # partials dropped, missing files fetched at the cached commit), then the same
+                # three checksum stages and the move as for a fresh download
                 # a partial file written in the last two minutes looks like a live download to
                 # hffinish (it cannot know the process is gone); wait that out and then go on
                 opts.wait = True
                 opts.poll = 10
                 self._start(
-                    finish_job(opts),
-                    f"resuming {item.repo_id}: hffinish " + " ".join(opts.argv()),
+                    download_job(item.repo_id, item.revision, opts, not opts.no_move, resume=True),
+                    f"resuming {item.repo_id}",
                     repo_ids=[item.repo_id],
                     ctx=("download", [item.repo_id], not opts.no_move, item.revision),
                 )
@@ -3122,6 +3539,7 @@ class MainWindow(QMainWindow):
         w.repo_update.connect(self._on_repo_update)
         w.transfer.connect(self._on_transfer)
         w.external.connect(self._on_external)
+        w.checksums.connect(self._on_checksums)
         w.done.connect(lambda rc, w=w: self._on_done(w, rc))
         self.workers.append(w)
         self._set_running(True)
@@ -3129,6 +3547,18 @@ class MainWindow(QMainWindow):
         return w
 
     # -- progress panel
+
+    @Slot(object)
+    def _on_checksums(self, report: ChecksumReport) -> None:
+        """A download finished (or gave up): log the three verdicts and show them in a pop-up."""
+        for stage in ("expected", "after_download", "after_move"):
+            ok, text = report.stage_verdict(stage)
+            self.append_line(("OK   " if ok else ("??   " if ok is None else "FAIL ")) + text)
+        dlg = ChecksumDialog(report, self)
+        self.checksum_dialogs.append(dlg)
+        dlg.finished.connect(lambda _r, d=dlg: self.checksum_dialogs.remove(d) if d in self.checksum_dialogs else None)
+        dlg.show()
+        dlg.raise_()
 
     def _transfer_row(self, repo_id: str) -> TransferRow:
         row = self.transfer_rows.get(repo_id)

@@ -155,6 +155,22 @@ three tabs.
   or "process gone". The rate itself is shown large, as bytes and bits per
   second, and drops to 0 B/s as soon as nothing has landed for 3 s instead of
   fading slowly.
+- **Downloads never stay stalled**: the heartbeat is also a watchdog for the
+  app's own downloads. When no byte has landed for 90 s it ends the download
+  command and starts it again (complete files are skipped by the downloader,
+  stale partial files are dropped first), as often as needed; a download that
+  exits with an error is retried up to 5 times. The wait between attempts
+  grows from 5 s to 60 s, the table shows "restarting", and every restart is
+  logged. Stop still ends everything at once.
+- **Three checksums per download**: before the download the Hub's checksum
+  of every file is fetched and logged (sha256 for LFS files, git blob sha1 for
+  small files). After the download every file is hashed in the cache and
+  compared; files that do not match are dropped and fetched again (up to 3
+  rounds). After the move every file is hashed once more in the library. All
+  digests go to the log, and a pop-up at the end shows the three stages with
+  a tick or a cross and a per-file table of the hashes ("Copy report" puts
+  it on the clipboard). The hffinish checksum option is skipped for these
+  runs because the files were hashed moments before.
 - **Another process's download**: when the finish pass finds a repo that
   another program is downloading (your own `hf download` in a terminal, for
   example), the window attaches the same meter to that download and shows
