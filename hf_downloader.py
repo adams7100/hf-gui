@@ -1434,12 +1434,48 @@ def category_color(task: str) -> QColor:
     return QColor(CATEGORY_COLORS[task_category(task)])
 
 
+def contrast_text(bg: QColor) -> QColor:
+    """Text colour for a coloured box: the opposite hue, pushed to the opposite lightness.
+
+    Dark boxes get a pale complementary tint, light boxes a deep one, so the text
+    is both the colour's opposite and readable.
+    """
+    r, g, b = bg.redF(), bg.greenF(), bg.blueF()
+
+    def lin(c: float) -> float:
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    def luminance(c: QColor) -> float:
+        return 0.2126 * lin(c.redF()) + 0.7152 * lin(c.greenF()) + 0.0722 * lin(c.blueF())
+
+    def ratio(a: QColor, b: QColor) -> float:
+        la, lb = luminance(a), luminance(b)
+        return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+    hue = bg.hslHueF()
+    hue = 0.0 if hue < 0 else (hue + 0.5) % 1.0  # complementary; greys have no hue
+    saturation = 0.0 if bg.hslSaturationF() < 0.08 else 0.45
+    pale = QColor.fromHslF(hue, saturation, 0.96)
+    deep = QColor.fromHslF(hue, saturation, 0.07)
+    # the opposite lightness first; fall back to the other side, then to white/black,
+    # so the text always clears the 4.5:1 contrast that body text needs
+    order = [pale, deep] if luminance(bg) < 0.3 else [deep, pale]
+    order += [QColor("#ffffff"), QColor("#000000")]
+    for candidate in order:
+        if ratio(bg, candidate) >= 4.5:
+            return candidate
+    return max(order, key=lambda c: ratio(bg, c))
+
+
 def tint_item(item: QTableWidgetItem, color: QColor) -> None:
-    """Coloured text on a light wash of the same colour; readable on light and dark themes."""
-    wash = QColor(color)
-    wash.setAlpha(48)
-    item.setBackground(wash)
-    item.setForeground(color)
+    """A solid coloured box with the text in the colour's opposite."""
+    item.setBackground(color)
+    item.setForeground(contrast_text(color))
+
+
+def chip_style(color: str) -> str:
+    """Stylesheet for a small coloured label with opposite-coloured text."""
+    return f"background: {color}; color: {contrast_text(QColor(color)).name()}; padding: 1px 7px; border-radius: 3px;"
 
 
 @dataclass
@@ -1649,7 +1685,8 @@ class BrowseTab(QWidget):
         legend = QHBoxLayout()
         legend.addWidget(QLabel("Categories:"))
         for name, color in CATEGORY_COLORS.items():
-            chip = QLabel(f"<span style='color:{color}'>&#9632;</span> {name}")
+            chip = QLabel(name)
+            chip.setStyleSheet(chip_style(color))
             chip.setToolTip(f"{name} models: the Task column is coloured like this")
             legend.addWidget(chip)
         legend.addSpacing(24)
@@ -1657,7 +1694,8 @@ class BrowseTab(QWidget):
         for name, color in LOCAL_COLORS.items():
             if name == "unverified":
                 continue
-            chip = QLabel(f"<span style='color:{color}'>&#9632;</span> {LIBRARY_LABELS.get(name, name)}")
+            chip = QLabel(LIBRARY_LABELS.get(name, name))
+            chip.setStyleSheet(chip_style(color))
             legend.addWidget(chip)
         legend.addStretch(1)
         root.addLayout(legend)
@@ -1673,7 +1711,7 @@ class BrowseTab(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)  # Ctrl/Shift-click for several
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self.table.doubleClicked.connect(lambda _idx: self._details())
@@ -1682,17 +1720,22 @@ class BrowseTab(QWidget):
 
         actions = QHBoxLayout()
         self.status = QLabel("Nothing scraped yet.")
+        self.selection_label = QLabel("")
+        self.selection_label.setToolTip("Ctrl-click or Shift-click rows to select several models; Ctrl+A selects the whole page")
         self.details_btn = QPushButton("View details")
-        self.details_btn.setToolTip("The whole model card with its images, plus the file list")
+        self.details_btn.setToolTip("The whole model card with its images, plus the file list (first selected model)")
         self.details_btn.clicked.connect(self._details)
         self.download_btn = QPushButton("Download")
+        self.download_btn.setToolTip("Download every selected model (several run at once, the rest queue up)")
         self.download_btn.clicked.connect(self._download)
+        mark(self.download_btn, "primary")
         self.add_btn = QPushButton("Add to list")
-        self.add_btn.setToolTip("Append it to the list on the Download tab")
+        self.add_btn.setToolTip("Append every selected model to the list on the Download tab")
         self.add_btn.clicked.connect(self._add)
         self.open_btn = QPushButton("Open on huggingface.co")
         self.open_btn.clicked.connect(self._open)
         actions.addWidget(self.status, 1)
+        actions.addWidget(self.selection_label)
         actions.addWidget(self.details_btn)
         actions.addWidget(self.download_btn)
         actions.addWidget(self.add_btn)
@@ -1840,17 +1883,23 @@ class BrowseTab(QWidget):
 
     # -- selection
 
+    def selected_models(self) -> list[HubModel]:
+        rows = sorted(idx.row() for idx in self.table.selectionModel().selectedRows())
+        return [self.table.item(r, 0).data(Qt.ItemDataRole.UserRole) for r in rows]
+
     def selected(self) -> HubModel | None:
-        rows = self.table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        return self.table.item(rows[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+        models = self.selected_models()
+        return models[0] if models else None
 
     @Slot()
     def _selection_changed(self) -> None:
-        on = self.selected() is not None
+        models = self.selected_models()
+        n = len(models)
         for btn in (self.details_btn, self.download_btn, self.add_btn, self.open_btn):
-            btn.setEnabled(on)
+            btn.setEnabled(n > 0)
+        self.download_btn.setText(f"Download {n} models" if n > 1 else "Download")
+        self.add_btn.setText(f"Add {n} to list" if n > 1 else "Add to list")
+        self.selection_label.setText(f"{n} selected" if n > 1 else "")
 
     def _details(self) -> None:
         m = self.selected()
@@ -1858,19 +1907,22 @@ class BrowseTab(QWidget):
             self.window.show_details(m.repo_id)
 
     def _download(self) -> None:
-        m = self.selected()
-        if m is not None:
-            self.window.download_repo(m.repo_id)
+        models = self.selected_models()
+        if len(models) == 1:
+            self.window.download_repo(models[0].repo_id)
+        elif models:
+            self.window.download_many([(m.repo_id, "") for m in models])
 
     def _add(self) -> None:
-        m = self.selected()
-        if m is not None:
+        for m in self.selected_models():
             self.window.add_to_list(m.repo_id)
 
     def _open(self) -> None:
-        m = self.selected()
-        if m is not None:
+        models = self.selected_models()
+        for m in models[:6]:  # a tab per model, within reason
             QDesktopServices.openUrl(QUrl(m.url))
+        if len(models) > 6:
+            self.window.statusBar().showMessage(f"opened the first 6 of {len(models)} selected models", 5000)
 
 
 # --------------------------------------------------------------------------- model card
@@ -2850,6 +2902,11 @@ class MainWindow(QMainWindow):
         if not items:
             QMessageBox.information(self, APP_NAME, "Paste one repo id or link per line into the list first.")
             return
+        self.download_many(items)
+
+    def download_many(self, items: list[tuple[str, str]]) -> None:
+        """Queue several repos (from the pasted list or a multi-selection in the Hub browser),
+        asking first about the ones that are already downloaded."""
         if self._exclusive_running():
             QMessageBox.information(self, APP_NAME, "A pass over the whole cache is running. Wait for it or stop it first.")
             return
@@ -2864,7 +2921,7 @@ class MainWindow(QMainWindow):
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Question)
             box.setWindowTitle(APP_NAME)
-            box.setText(f"{len(already)} of the {len(items)} repo(s) in the list have already been downloaded:\n\n{shown}")
+            box.setText(f"{len(already)} of the {len(items)} selected repo(s) have already been downloaded:\n\n{shown}")
             box.setInformativeText("Are you sure you want to download them again?")
             again = box.addButton("Download again", QMessageBox.ButtonRole.YesRole)
             skip = box.addButton("Skip those", QMessageBox.ButtonRole.NoRole)
@@ -2876,7 +2933,7 @@ class MainWindow(QMainWindow):
                 done = {r for r, _s in already}
                 items = [it for it in items if it[0] not in done]
                 if not items:
-                    self.statusBar().showMessage("Everything in the list is already downloaded.", 6000)
+                    self.statusBar().showMessage("Everything selected is already downloaded.", 6000)
                     return
             elif clicked is not again:
                 return
@@ -3349,7 +3406,7 @@ QGroupBox {{ border: 1px solid palette(mid); border-radius: 6px; margin-top: 12p
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {ACCENT}; font-weight: bold; }}
 QProgressBar {{ border: 1px solid palette(mid); border-radius: 4px; text-align: center; height: 20px; }}
 QProgressBar::chunk {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffb347, stop:1 {ACCENT}); border-radius: 3px; }}
-QPushButton[primary="true"] {{ background: {ACCENT}; color: #1f1300; font-weight: bold; border: 1px solid #c97a00; border-radius: 4px; padding: 5px 14px; }}
+QPushButton[primary="true"] {{ background: {ACCENT}; color: {contrast_text(QColor(ACCENT)).name()}; font-weight: bold; border: 1px solid #c97a00; border-radius: 4px; padding: 5px 14px; }}
 QPushButton[primary="true"]:hover {{ background: #ffb347; }}
 QPushButton[primary="true"]:pressed {{ background: #e68d00; }}
 QPushButton[primary="true"]:disabled {{ background: palette(mid); color: palette(dark); border-color: palette(mid); }}

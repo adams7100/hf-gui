@@ -194,9 +194,11 @@ updated, created). "Scrape page 1" fetches the first page, "Next page"
 appends the following one, as often as you like. Every column (model, author,
 task, library, downloads last month, all-time downloads, likes, trending,
 updated, created, gated, tags) sorts by clicking its header, numbers and
-dates numerically. "Download" starts the selected model on the Download tab,
-"Add to list" appends it to the list there, "View details" (or a double
-click) opens the model card window: the whole README rendered with its
+dates numerically. Several rows can be selected at once (Ctrl-click, Shift-click, Ctrl+A for the
+page): "Download" queues every selected model on the Download tab (asking
+first about the ones already downloaded), "Add to list" appends them all to
+the list there, "Open on huggingface.co" opens a tab for each. "View details"
+(or a double click) opens the model card window for the first selected one: the whole README rendered with its
 images, the front-matter facts (license, base model, language, tags, ...),
 download, like and task statistics, and the file list with sizes. Nothing of
 this touches the hub cache; the card and its pictures are fetched directly.
@@ -211,9 +213,11 @@ list, brings up a pop-up that says so and asks whether you are sure; for a
 list you can also skip the ones already downloaded. The Task column is
 coloured by **category** (Multimodal, Text, Image, Video, Audio, Embeddings,
 Agents, Other, with a legend above the table), and the model card window
-shows the same colour; the window itself carries the Hugging Face orange as
-accent on tabs, primary buttons, progress bars and table headers, on top of
-the system's light or dark theme.
+shows the same colour. Every coloured cell is a solid box whose text is the
+box colour's opposite: the complementary hue, pale on a dark box and deep on
+a light one, so it reads clearly in both themes. The window itself carries
+the Hugging Face orange as accent on tabs, primary buttons, progress bars
+and table headers, on top of the system's light or dark theme.
 
 **Libraries** tab: every model folder in the library (the destination), with
 state, an action button, file count, size, last change, details and path. The
