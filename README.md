@@ -129,6 +129,20 @@ three tabs.
   upload, from `psutil`). The meter watches the repo's blobs folder once a
   second, so it is exact whatever downloader is at work, including a resume
   started by the finish pass.
+- **Heartbeat**: the meter is also a watchdog. Every second it checks that
+  the byte count on disk is still moving and that the downloading process is
+  still alive, and says so next to the rate: "receiving data" (green), "no
+  data for N s" (amber after 20 s), "stalled" (red after 90 s, also logged)
+  or "process gone". The rate itself is shown large, as bytes and bits per
+  second, and drops to 0 B/s as soon as nothing has landed for 3 s instead of
+  fading slowly.
+- **Another process's download**: when the finish pass finds a repo that
+  another program is downloading (your own `hf download` in a terminal, for
+  example), the window attaches the same meter to that download and shows
+  its progress, rate and heartbeat in the panel, naming the process id. When
+  that process ends the repo is verified automatically. A "Stop other
+  process" button ends it if you would rather continue the download here with
+  Resume.
 - **Resume**: a stopped download (Stop, crash, lost network, closed window)
   is picked up with the Resume button next to Download, or "Resume download"
   on the Libraries tab. Complete files are kept; partial `*.incomplete` files

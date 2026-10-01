@@ -43,7 +43,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImage
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -248,6 +248,44 @@ class Transfer:
     down: float  # machine-wide network bytes/s received (psutil), -1 if unavailable
     up: float  # machine-wide network bytes/s sent, -1 if unavailable
     final: bool = False
+    stalled: float = 0.0  # seconds since the last byte landed on disk (the heartbeat)
+    alive: bool = True  # the downloading process still exists
+    external: bool = False  # another process's download, watched rather than run by us
+    pid: int = 0
+    repo_id: str = ""
+
+
+STALL_WARN_S = 20  # heartbeat: no bytes for this long is shown as a warning
+STALL_ALARM_S = 90  # ... and for this long as a stall
+
+
+def heartbeat_text(t: "Transfer") -> tuple[str, str]:
+    """(text, colour) of the heartbeat for a reading."""
+    if t.final:
+        return ("finished" if t.alive else "process ended", "#5f6368")
+    if not t.alive:
+        return ("process gone", "#c5221f")
+    if t.stalled >= STALL_ALARM_S:
+        return (f"stalled: no data for {int(t.stalled) // 60}:{int(t.stalled) % 60:02d}", "#c5221f")
+    if t.stalled >= STALL_WARN_S:
+        return (f"no data for {int(t.stalled)} s", "#b06000")
+    return ("receiving data", "#1e8e3e")
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if psutil is not None:
+        try:
+            p = psutil.Process(pid)
+            return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
+        except psutil.Error:
+            return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def rate(bytes_per_s: float) -> str:
@@ -270,16 +308,44 @@ class TransferMeter(threading.Thread):
     repo's blobs folder grow is exact and works for every downloader.
     """
 
-    def __init__(self, emit, label: str, repo_id: str, cache_dir: Path, expected: int) -> None:
+    def __init__(
+        self,
+        emit,
+        label: str,
+        repo_id: str,
+        cache_dir: Path,
+        expected,  # int, or a callable returning one (run off the GUI thread)
+        alive=None,  # callable -> bool; the meter ends by itself once it returns False
+        external: bool = False,
+        pid: int = 0,
+    ) -> None:
         super().__init__(daemon=True, name="transfer-meter")
         self.emit = emit
         self.label = label
+        self.repo_id = repo_id
         self.repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
         self.expected = expected
+        self.alive = alive
+        self.external = external
+        self.pid = pid
         self._stop = threading.Event()
+        self._final_on_stop = True
 
-    def stop(self) -> None:
+    def stop(self, final: bool = True) -> None:
+        """End the meter. With final=False no closing reading is sent (the watcher lost interest)."""
+        self._final_on_stop = final
         self._stop.set()
+
+    def _reading(self, done: int, total: int, speed: float, down: float, up: float, stalled: float, alive: bool, final=False) -> Transfer:
+        return Transfer(
+            self.label, done, total, speed, down, up, final, stalled, alive, self.external, self.pid, self.repo_id
+        )
+
+    def _emit(self, reading: Transfer) -> None:
+        try:
+            self.emit(reading)
+        except RuntimeError:  # the window (signal source) is gone: nobody to tell
+            self._stop.set()
 
     def measure(self) -> int:
         total = 0
@@ -310,15 +376,30 @@ class TransferMeter(threading.Thread):
     def run(self) -> None:
         last_t = time.monotonic()
         last = self.measure()
+        changed_t = last_t
         net = self._net()
         speed = 0.0
-        self.emit(Transfer(self.label, last, self.expected, 0.0, -1.0 if net is None else 0.0, -1.0 if net is None else 0.0))
+        alive = True
+        total = 0
+        no_net = -1.0 if net is None else 0.0
+        self._emit(self._reading(last, total, 0.0, no_net, no_net, 0.0, alive))
+        if callable(self.expected):
+            try:
+                total = int(self.expected() or 0)
+            except Exception:  # noqa: BLE001 - the bar just stays indeterminate
+                total = 0
+        else:
+            total = int(self.expected or 0)
         while not self._stop.wait(1.0):
             now = time.monotonic()
             cur = self.measure()
             dt = max(now - last_t, 1e-3)
+            if cur != last:
+                changed_t = now
             inst = max(cur - last, 0) / dt
             speed = inst if speed == 0 else 0.7 * speed + 0.3 * inst
+            if now - changed_t >= 3:
+                speed = 0.0  # nothing landed for a while: say so instead of decaying slowly
             down = up = -1.0
             net2 = self._net()
             if net is not None and net2 is not None:
@@ -326,8 +407,29 @@ class TransferMeter(threading.Thread):
                 up = max(net2.bytes_sent - net.bytes_sent, 0) / dt
             net = net2
             last_t, last = now, cur
-            self.emit(Transfer(self.label, cur, self.expected, speed, down, up))
-        self.emit(Transfer(self.label, self.measure(), self.expected, 0.0, -1.0, -1.0, final=True))
+            if self.alive is not None:
+                try:
+                    alive = bool(self.alive())
+                except Exception:  # noqa: BLE001
+                    alive = True
+            self._emit(self._reading(cur, total, speed, down, up, now - changed_t, alive))
+            if not alive:
+                break
+        if not alive or self._final_on_stop:
+            self._emit(self._reading(self.measure(), total, 0.0, -1.0, -1.0, 0.0, alive, final=True))
+
+
+def cached_expected_size(repo_id: str, cache_dir: Path) -> int:
+    """Bytes the cached revision of a repo should hold, from the on-disk file list (0 if none)."""
+    repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
+    try:
+        for tree_file in (repo_dir / "trees").glob("*.json"):
+            data = json.loads(tree_file.read_text())
+            if data.get("format_version") == 1:
+                return sum(int(e["size"]) for e in data["files"].values())
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return 0
 
 
 def expected_size(repo_id: str, revision: str) -> int:
@@ -445,6 +547,7 @@ class Worker(QThread):
     repos_found = Signal(list)  # repo ids the job is about to work on
     repo_update = Signal(str, str, str, object)  # repo id, status, note, total bytes or None
     transfer = Signal(object)  # a Transfer reading of the running download
+    external = Signal(str, str)  # repo id, reason: another process is downloading this repo
     done = Signal(int)  # exit code
 
     def __init__(self, job, cache_dir: Path, parent=None) -> None:
@@ -477,8 +580,22 @@ class Worker(QThread):
 
     def start_meter(self, repo_id: str, expected: int) -> None:
         self.stop_meter()
-        self._meter = TransferMeter(self.transfer.emit, self.batch_label + repo_id, repo_id, self.cache_dir, expected)
+        self._meter = TransferMeter(
+            self.transfer.emit,
+            self.batch_label + repo_id,
+            repo_id,
+            self.cache_dir,
+            expected or (lambda: cached_expected_size(repo_id, self.cache_dir)),
+            alive=self._download_alive,
+        )
         self._meter.start()
+
+    def _download_alive(self) -> bool:
+        """Heartbeat for our own download: the child process is still there (in-process
+        downloads have no child, so they count as alive until the job returns)."""
+        with self._lock:
+            proc = self._proc
+        return proc is None or proc.poll() is None
 
     def stop_meter(self) -> None:
         if self._meter is not None:
@@ -520,6 +637,7 @@ class Worker(QThread):
         self.line.emit(f"{stamp} [{repo.repo_id}] {msg}" if repo else f"{stamp} {msg}")
         if repo is not None and msg.startswith("being downloaded by another process"):
             self.repo_update.emit(repo.repo_id, "downloading", msg, repo.total_bytes or None)
+            self.external.emit(repo.repo_id, msg)
 
     def _process(self, repo, *args) -> None:
         self.repo_update.emit(repo.repo_id, "checking", "", None)
@@ -1894,6 +2012,15 @@ STATUS_COLORS = {
 }
 
 
+class _Bridge(QObject):
+    """Carries meter readings from a plain thread into the GUI thread."""
+
+    transfer = Signal(object)
+
+
+EXT_PID_RE = re.compile(r"pid (\d+)")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1905,6 +2032,11 @@ class MainWindow(QMainWindow):
         self._download_ctx: tuple[list[str], bool] | None = None  # (repo ids, finish after) of the running download
         self._verify_ctx: list[str] | None = None  # repo ids a verification pass is about
         self.card_dialog: ModelCardDialog | None = None
+        self.ext_meter: TransferMeter | None = None  # watching another process's download
+        self.ext_bridge = _Bridge(self)
+        self.ext_bridge.transfer.connect(self._on_transfer)
+        self._own_active = False  # our own download's meter is currently reporting
+        self._stall_logged = False
         self._build_ui()
         self._build_menu()
         self._load_settings()
@@ -2078,18 +2210,46 @@ class MainWindow(QMainWindow):
         form.addRow(buttons)
         root.addWidget(fin)
 
-        # progress of the running download
-        prog = QHBoxLayout()
+        # progress of the running download: bar, big rate, heartbeat, details
+        prog_box = QGroupBox("Download progress")
+        prog = QVBoxLayout(prog_box)
+        top_row = QHBoxLayout()
         self.xfer_bar = QProgressBar()
         self.xfer_bar.setRange(0, 1000)
         self.xfer_bar.setValue(0)
         self.xfer_bar.setFormat("%p%")
         self.xfer_bar.setMinimumWidth(220)
+        self.xfer_bar.setMinimumHeight(26)
+        self.rate_label = QLabel("—")
+        rate_font = QFont(self.rate_label.font())
+        rate_font.setPointSize(rate_font.pointSize() + 6)
+        rate_font.setBold(True)
+        self.rate_label.setFont(rate_font)
+        self.rate_label.setMinimumWidth(300)
+        self.rate_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.rate_label.setToolTip("Bytes landing in the hub cache per second, as bytes and bits")
+        self.rate_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        top_row.addWidget(self.xfer_bar, 1)
+        top_row.addWidget(self.rate_label)
+        prog.addLayout(top_row)
+        info_row = QHBoxLayout()
         self.xfer_label = QLabel("No download running.")
         self.xfer_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        prog.addWidget(self.xfer_bar, 1)
-        prog.addWidget(self.xfer_label, 2)
-        root.addLayout(prog)
+        self.heartbeat_label = QLabel("")
+        self.heartbeat_label.setToolTip(
+            "Heartbeat: every second the meter checks that bytes are still landing in the cache "
+            "and that the downloading process is still alive"
+        )
+        self.kill_btn = QPushButton("Stop other process")
+        self.kill_btn.setToolTip("End the other program's download of this repo so it can be resumed here")
+        self.kill_btn.clicked.connect(self._kill_external)
+        mark(self.kill_btn, "danger")
+        self.kill_btn.setVisible(False)
+        info_row.addWidget(self.xfer_label, 1)
+        info_row.addWidget(self.heartbeat_label)
+        info_row.addWidget(self.kill_btn)
+        prog.addLayout(info_row)
+        root.addWidget(prog_box)
 
         # results: table above, log below
         self.table = QTableWidget(0, 4)
@@ -2436,13 +2596,22 @@ class MainWindow(QMainWindow):
         w.repos_found.connect(self._on_repos_found)
         w.repo_update.connect(self._on_repo_update)
         w.transfer.connect(self._on_transfer)
+        w.external.connect(self._on_external)
         w.done.connect(self._on_done)
         self.worker = w
         self._set_running(True)
         w.start()
 
+    # -- progress panel
+
     @Slot(object)
     def _on_transfer(self, t: Transfer) -> None:
+        if not t.external:
+            self._own_active = not t.final
+        elif self._own_active:
+            return  # our own download owns the panel while it runs
+        if t.external and t.final:
+            self._external_ended(t)
         if t.total > 0:
             self.xfer_bar.setRange(0, 1000)
             self.xfer_bar.setValue(max(0, min(1000, int(1000 * t.done / t.total))))
@@ -2450,19 +2619,117 @@ class MainWindow(QMainWindow):
         else:
             self.xfer_bar.setRange(0, 0)  # size unknown: busy bar
             self.xfer_bar.setFormat(hff.human(t.done))
+        who = f"other process (pid {t.pid}) downloading {t.repo_id}" if t.external else t.label
+        hb_text, hb_color = heartbeat_text(t)
+        self.heartbeat_label.setText(f"<b style='color:{hb_color}'>&#9679; {hb_text}</b>")
         if t.final:
-            self.xfer_label.setText(f"{t.label}: finished, {hff.human(t.done)} in the cache")
+            self.rate_label.setText("—")
+            self.xfer_label.setText(f"{who}: ended with {hff.human(t.done)} in the cache")
             self.xfer_bar.setRange(0, 1000)
             self.xfer_bar.setValue(1000 if t.total and t.done >= t.total else self.xfer_bar.value())
+            self._stall_logged = False
             return
-        bits = [f"{t.label}: {rate(t.speed)}"]
-        if t.total > 0 and t.speed > 0 and t.done < t.total:
-            secs = int((t.total - t.done) / t.speed)
-            eta = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}" if secs >= 3600 else f"{secs // 60}:{secs % 60:02d}"
-            bits.append(f"ETA {eta}")
+        self.rate_label.setText(rate(t.speed) if t.speed > 0 else "0 B/s")
+        self.rate_label.setStyleSheet("" if t.stalled < STALL_WARN_S else f"color: {hb_color}")
+        bits = [who]
+        if t.total > 0:
+            bits.append(f"{hff.human(t.done)} of {hff.human(t.total)}")
+            if t.speed > 0 and t.done < t.total:
+                secs = int((t.total - t.done) / t.speed)
+                eta = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}" if secs >= 3600 else f"{secs // 60}:{secs % 60:02d}"
+                bits.append(f"ETA {eta}")
+        else:
+            bits.append(f"{hff.human(t.done)} so far (size not known yet)")
         if t.down >= 0:
             bits.append(f"network down {rate(t.down)}, up {rate(t.up)}")
         self.xfer_label.setText("   ".join(bits))
+        if t.stalled >= STALL_ALARM_S and not self._stall_logged:
+            self._stall_logged = True
+            self.append_line(f"heartbeat: no data has landed for {who} in {int(t.stalled)} s")
+        elif t.stalled < STALL_WARN_S and self._stall_logged:
+            self._stall_logged = False
+            self.append_line(f"heartbeat: {who} is receiving data again")
+
+    @Slot(str, str)
+    def _on_external(self, repo_id: str, reason: str) -> None:
+        """hffinish found another process downloading this repo: show that download's progress."""
+        if self.ext_meter is not None and self.ext_meter.repo_id == repo_id and self.ext_meter.is_alive():
+            return
+        self.stop_external()
+        m = EXT_PID_RE.search(reason)
+        pid = int(m.group(1)) if m else 0
+        cache = self._options().cache_path()
+        repo_dir = cache / f"models--{repo_id.replace('/', '--')}"
+
+        def alive() -> bool:
+            if pid:
+                return pid_alive(pid)
+            # no pid known (lock or fresh partial file): alive while either sign persists
+            for lock in (cache / ".locks" / repo_dir.name).glob("*.lock"):
+                if hff.lock_is_held(lock):
+                    return True
+            now = time.time()
+            for part in (repo_dir / "blobs").glob("*.incomplete"):
+                try:
+                    if now - part.stat().st_mtime < hff.ACTIVE_WINDOW_S:
+                        return True
+                except OSError:
+                    continue
+            return False
+
+        def expected() -> int:
+            return cached_expected_size(repo_id, cache) or expected_size(repo_id, "")
+
+        self.ext_meter = TransferMeter(
+            self.ext_bridge.transfer.emit, repo_id, repo_id, cache, expected, alive=alive, external=True, pid=pid
+        )
+        self.ext_meter.start()
+        self.kill_btn.setVisible(bool(pid) and psutil is not None)
+        self.kill_btn.setText(f"Stop other process (pid {pid})" if pid else "Stop other process")
+        why = re.search(r"\((.*)\)", reason)
+        self.append_line(f"watching the other process's download of {repo_id} ({why.group(1) if why else reason})")
+
+    def stop_external(self) -> None:
+        if self.ext_meter is not None:
+            self.ext_meter.stop(final=False)
+            self.ext_meter = None
+        self.kill_btn.setVisible(False)
+
+    def _external_ended(self, t: Transfer) -> None:
+        if self.ext_meter is not None and self.ext_meter.repo_id != t.repo_id:
+            return  # a reading from a watch that was already replaced
+        self.ext_meter = None
+        self.kill_btn.setVisible(False)
+        self.append_line(f"the other process's download of {t.repo_id} has ended ({hff.human(t.done)} in the cache); verifying")
+        self.library.refresh()
+        self.browse.refresh_local()
+        if self.worker is None:
+            QTimer.singleShot(0, lambda: self.start_verify(t.repo_id))
+
+    @Slot()
+    def _kill_external(self) -> None:
+        meter = self.ext_meter
+        if meter is None or not meter.pid or psutil is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            APP_NAME,
+            f"Stop the other process (pid {meter.pid}) that is downloading {meter.repo_id}?\n\n"
+            "Its partial files are kept until you resume the download here, which drops them "
+            "and fetches only the files that are still missing.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            proc = psutil.Process(meter.pid)
+            for child in proc.children(recursive=True):
+                child.terminate()
+            proc.terminate()
+            self.append_line(f"stopped process {meter.pid}; use Resume to pick {meter.repo_id} up here")
+        except psutil.Error as exc:
+            self.append_line(f"could not stop process {meter.pid}: {exc}")
 
     @Slot(int)
     def _on_done(self, rc: int) -> None:
@@ -2517,17 +2784,23 @@ class MainWindow(QMainWindow):
             wdg.setEnabled(not running)
         self.stop_btn.setEnabled(running)
         self.busy.setVisible(running)
-        if running:
+        watching = self.ext_meter is not None and self.ext_meter.is_alive()
+        if running and not watching:
             self.xfer_bar.setRange(0, 1000)
             self.xfer_bar.setValue(0)
             self.xfer_bar.setFormat("%p%")
+            self.rate_label.setText("—")
+            self.heartbeat_label.setText("")
             self.xfer_label.setText("Waiting for a download to start...")
-        else:
+        elif not running:
             self.progress_label.setText("")
-            if self.xfer_bar.maximum() == 0:
-                self.xfer_bar.setRange(0, 1000)
-            if self.xfer_label.text().startswith("Waiting"):
-                self.xfer_label.setText("No download running.")
+            self._own_active = False
+            if not watching:
+                if self.xfer_bar.maximum() == 0:
+                    self.xfer_bar.setRange(0, 1000)
+                if self.xfer_label.text().startswith("Waiting"):
+                    self.xfer_label.setText("No download running.")
+                    self.heartbeat_label.setText("")
 
     @Slot(int)
     def _tab_changed(self, index: int) -> None:
@@ -2625,6 +2898,7 @@ class MainWindow(QMainWindow):
             self.browse.worker.wait(5000)
         if self.browse.local_worker is not None:
             self.browse.local_worker.wait(5000)
+        self.stop_external()
         if self.card_dialog is not None:
             self.card_dialog.close()
         self._save_settings()
