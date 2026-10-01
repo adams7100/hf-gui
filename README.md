@@ -118,10 +118,16 @@ three tabs.
   files.
 - **Download a list**: paste any number of repos, one per line in any of the
   forms above (blank lines and `#` comments are skipped, duplicates dropped),
-  and click "Download all". They are downloaded one after the other, each
-  verified and moved when "then move it to the library" is on; lines that are
-  not repos are shown before the run starts and skipped. The list is kept
-  between starts, and the Hub browser's "Add to list" appends to it.
+  and click "Download all". Lines that are not repos are shown before the run
+  starts and skipped. The list is kept between starts, and the Hub browser's
+  "Add to list" appends to it.
+- **Several at once**: downloads run side by side, as many as the "download N
+  at once" box allows (default 3); the rest wait in a queue and start as slots
+  free up. Each running download has its own row in the progress panel with
+  its own Stop button, and the table marks queued repos as "queued". Each one
+  is verified and moved on its own when "then move it to the library" is on.
+  More downloads can be added while others run; only "Check (dry run)" and
+  "Finish and move", which walk the whole cache, wait until nothing else runs.
 - **Progress**: while a download runs, a progress bar shows bytes in the cache
   against the size the Hub reports for the repo, with the download rate into
   the cache as bytes and bits per second (`85.3 MB/s (682 Mbit/s)`), an ETA,
@@ -197,19 +203,21 @@ accent on tabs, primary buttons, progress bars and table headers, on top of
 the system's light or dark theme.
 
 **Libraries** tab: every model folder in the library (the destination), with
-state, file count, size, last change, details and path; a folder that an
-interrupted move left behind is marked "moving". Models that still sit in the
-hub cache are listed too and checked file by file against the file list
-huggingface_hub keeps next to the snapshot, without touching the network:
-"in cache" means every file is there with the right size, "incomplete" shows
-how many files and bytes are still to fetch (plus any partial files a stopped
-download left), "downloading" means another process is fetching it right now
-(a held download lock or a partial file written in the last two minutes),
-"unverified" means no file list is on disk yet. "Verify" runs
-the full check against the Hub for the selected cached model, "Resume
-download" fetches what is missing and moves it to the library. Double-click
-a row or use "Open model folder" to open it in Explorer. The list refreshes
-when the tab is shown and after every job.
+state, an action button, file count, size, last change, details and path. The
+State column says whether a model is finished: "finished" (in the library),
+"finished, in cache" (every file there with the right size, not moved yet),
+"not finished" (how many files and bytes are still to fetch, plus any partial
+files a stopped download left), "downloading" (another process is fetching it
+right now: a held download lock or a partial file written in the last two
+minutes), "moving" (a folder an interrupted move left behind) or "unverified"
+(no file list on disk yet). Cached models are checked file by file against
+the file list huggingface_hub keeps next to the snapshot, without touching
+the network. Every row carries its own button: "Resume download" for a model
+that is not finished, "Move to library" for one finished in the cache, "Open
+folder" for one in the library. "Verify" above the table runs the full check
+against the Hub for the selected cached model. Double-click a row or use
+"Open model folder" to open it in Explorer. The list refreshes when the tab
+is shown and after every job.
 
 Settings are remembered between starts. Start it with `HF-Downloader.cmd`
 (creates `.venv` with `huggingface_hub`, `PySide6` and `psutil` on first run)

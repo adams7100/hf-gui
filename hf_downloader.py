@@ -21,7 +21,6 @@ and shows what it does.
 from __future__ import annotations
 
 import codecs
-import contextlib
 import importlib.machinery
 import importlib.util
 import json
@@ -534,12 +533,85 @@ class _LineSplitter:
         return False
 
 
+# hffinish's `log`, `run_download` and `process` and the process's stdout/stderr
+# are replaced once, by dispatchers that look up the Worker of the calling
+# thread. Several workers can then run at the same time, each receiving only
+# its own messages, output and status changes.
+_current = threading.local()
+_ORIG: dict[str, Any] = {}
+
+
+def _hook_log(repo, msg: str) -> None:
+    w = getattr(_current, "worker", None)
+    if w is None:
+        return _ORIG["log"](repo, msg)
+    w._log(repo, msg)
+
+
+def _hook_run_download(repo, cmd: list[str], env: dict[str, str]) -> int:
+    w = getattr(_current, "worker", None)
+    if w is None:
+        return _ORIG["run_download"](repo, cmd, env)
+    return w._run_download(repo, cmd, env)
+
+
+def _hook_process(repo, *args) -> None:
+    w = getattr(_current, "worker", None)
+    if w is None:
+        return _ORIG["process"](repo, *args)
+    return w._process(repo, *args)
+
+
+class _ThreadStdout:
+    """sys.stdout/sys.stderr replacement: a worker thread's output goes to its own sink."""
+
+    encoding = "utf-8"
+    errors = "replace"
+
+    def __init__(self, orig) -> None:
+        self.orig = orig  # None under pythonw
+
+    def write(self, text: str) -> int:
+        sink = getattr(_current, "sink", None)
+        if sink is not None:
+            return sink.write(text)
+        if self.orig is not None:
+            return self.orig.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        sink = getattr(_current, "sink", None)
+        if sink is not None:
+            sink.flush()
+        elif self.orig is not None:
+            self.orig.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        if self.orig is None:
+            raise OSError("no console")
+        return self.orig.fileno()
+
+
+def install_hooks() -> None:
+    if _ORIG:
+        return
+    _ORIG.update(log=hff.log, run_download=hff.run_download, process=hff.process)
+    hff.log, hff.run_download, hff.process = _hook_log, _hook_run_download, _hook_process
+    sys.stdout = _ThreadStdout(sys.stdout)
+    sys.stderr = _ThreadStdout(sys.stderr)
+
+
 class Worker(QThread):
     """Runs one job (a callable taking the worker) off the GUI thread.
 
-    While it runs, hffinish's `log`, `run_download` and `process` are replaced
-    so every message, every byte of download output and every status change
-    arrives here as a signal.
+    Every hffinish message, every byte of download output and every status
+    change made on this thread arrives here as a signal (see install_hooks).
+    Several workers may run at once; `kind` says how they mix: "download"
+    jobs (one repo each) run side by side, an "exclusive" job (a pass over
+    the whole cache) runs alone.
     """
 
     line = Signal(str)  # a finished log line
@@ -554,7 +626,11 @@ class Worker(QThread):
         super().__init__(parent)
         self.job = job
         self.cache_dir = cache_dir
-        self.batch_label = ""  # "[2/5] " while a list is being downloaded
+        self.kind = "download"  # or "exclusive"
+        self.repo_ids: list[str] = []  # repos this job is about (for the per-repo Stop)
+        self.ctx: tuple | None = None  # ("download", repo_ids, finish_after) or ("verify", repo_ids)
+        self.current_repo = ""  # repo whose download the meter is measuring right now
+        self.rc: int | None = None
         self._cancel = threading.Event()
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
@@ -580,9 +656,10 @@ class Worker(QThread):
 
     def start_meter(self, repo_id: str, expected: int) -> None:
         self.stop_meter()
+        self.current_repo = repo_id
         self._meter = TransferMeter(
             self.transfer.emit,
-            self.batch_label + repo_id,
+            repo_id,
             repo_id,
             self.cache_dir,
             expected or (lambda: cached_expected_size(repo_id, self.cache_dir)),
@@ -606,25 +683,26 @@ class Worker(QThread):
     # -- thread body
 
     def run(self) -> None:
+        install_hooks()
         sink = _LineSplitter(self)
-        saved = (hff.log, hff.run_download, hff.process)
-        self._orig_process = hff.process
-        hff.log, hff.run_download, hff.process = self._log, self._run_download, self._process
+        _current.worker = self
+        _current.sink = sink
         rc = 1
         try:
-            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-                try:
-                    rc = int(self.job(self) or 0)
-                except KeyboardInterrupt:
-                    rc = 130
-                    self.line.emit("stopped")
-                except Exception:  # noqa: BLE001 - show it in the log instead of dying silently
-                    self.line.emit(traceback.format_exc().rstrip())
-                    rc = 1
+            try:
+                rc = int(self.job(self) or 0)
+            except KeyboardInterrupt:
+                rc = 130
+                self.line.emit("stopped")
+            except Exception:  # noqa: BLE001 - show it in the log instead of dying silently
+                self.line.emit(traceback.format_exc().rstrip())
+                rc = 1
         finally:
             sink.flush()
             self.stop_meter()
-            hff.log, hff.run_download, hff.process = saved
+            _current.worker = None
+            _current.sink = None
+        self.rc = rc
         self.progress.emit("")
         self.done.emit(rc)
 
@@ -642,7 +720,7 @@ class Worker(QThread):
     def _process(self, repo, *args) -> None:
         self.repo_update.emit(repo.repo_id, "checking", "", None)
         try:
-            self._orig_process(repo, *args)
+            _ORIG["process"](repo, *args)
         finally:
             self.repo_update.emit(repo.repo_id, repo.status or "checked", repo.note, repo.total_bytes or None)
 
@@ -762,31 +840,6 @@ def download_job(repo_id: str, revision: str, opts: Options, finish_after: bool)
     def job(w: Worker) -> int:
         w.repos_found.emit([repo_id])
         return _download_one(w, repo_id, revision, opts, finish_after)
-
-    return job
-
-
-def batch_job(items: list[tuple[str, str]], opts: Options, finish_after: bool):
-    """Download a pasted list one repo after the other; exit 1 if any of them failed."""
-
-    def job(w: Worker) -> int:
-        w.repos_found.emit([repo_id for repo_id, _rev in items])
-        failed: list[str] = []
-        for n, (repo_id, revision) in enumerate(items, 1):
-            if w.cancelled:
-                raise KeyboardInterrupt
-            w.batch_label = f"[{n}/{len(items)}] "
-            w.line.emit(f"== [{n}/{len(items)}] {repo_id}" + (f" @ {revision}" if revision else ""))
-            rc = _download_one(w, repo_id, revision, opts, finish_after)
-            if rc != 0:
-                failed.append(repo_id)
-            w.line.emit("")
-        w.batch_label = ""
-        if failed:
-            w.line.emit(f"{len(failed)} of {len(items)} download(s) did not finish: " + ", ".join(failed))
-            return 1
-        w.line.emit(f"all {len(items)} download(s) finished")
-        return 0
 
     return job
 
@@ -1019,6 +1072,7 @@ class LibraryTab(QWidget):
         self.resume_btn = QPushButton("Resume download")
         self.resume_btn.setToolTip("Fetch what is missing of the selected cached model, then move it to the library")
         self.resume_btn.clicked.connect(self._resume_selected)
+        mark(self.resume_btn, "primary")
         top.addWidget(QLabel("Library:"))
         top.addWidget(self.where, 1)
         top.addWidget(self.verify_btn)
@@ -1028,14 +1082,14 @@ class LibraryTab(QWidget):
         top.addWidget(self.refresh_btn)
         root.addLayout(top)
 
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["Model", "State", "Files", "Size", "Last changed", "Details", "Folder"])
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["Model", "State", "Action", "Files", "Size", "Last changed", "Details", "Folder"])
         header = self.table.horizontalHeader()
         header.setMinimumSectionSize(70)
-        for col in range(5):
+        for col in range(6):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1085,7 +1139,8 @@ class LibraryTab(QWidget):
                 size = f"{hff.human(e.size)} / {hff.human(e.expected_size)}"
             cells = [
                 e.name,
-                e.state,
+                LIBRARY_LABELS.get(e.state, e.state),
+                "",
                 files,
                 size,
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(e.modified)) if e.modified else "",
@@ -1096,27 +1151,57 @@ class LibraryTab(QWidget):
                 item = QTableWidgetItem(text)
                 if col == 0:
                     item.setData(Qt.ItemDataRole.UserRole, e)
-                if col in (2, 3):
+                if col in (3, 4):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 if col == 1:
                     color = LIBRARY_COLORS.get(e.state)
                     if color:
                         tint_item(item, QColor(color))
                 self.table.setItem(row, col, item)
+            action = self._action_button(e)
+            if action is not None:
+                self.table.setCellWidget(row, 2, action)
         self.table.setSortingEnabled(True)
         self._selection_changed()
         ready = [e for e in entries if e.state == "ready"]
         cached = [e for e in entries if e.in_cache]
         incomplete = [e for e in entries if e.state == "incomplete"]
         downloading = [e for e in entries if e.state == "downloading"]
-        text = f"{len(ready)} model(s) in the library, {hff.human(sum(e.size for e in ready))}"
+        text = f"{len(ready)} finished model(s) in the library, {hff.human(sum(e.size for e in ready))}"
         if cached:
             text += f"; {len(cached)} in the hub cache"
             if downloading:
                 text += f", {len(downloading)} being downloaded by another process"
             if incomplete:
-                text += f", {len(incomplete)} incomplete (select it and click Resume download)"
+                text += f", {len(incomplete)} not finished (click its Resume download button)"
         self.summary.setText(text)
+
+    def _action_button(self, e: LibraryEntry) -> QPushButton | None:
+        """The row's own button: resume a download that is not finished, move a finished one out of the cache."""
+        if e.state in ("incomplete", "unverified"):
+            btn = QPushButton("Resume download")
+            btn.setToolTip("Fetch the missing files of this model, verify it and move it to the library")
+            btn.clicked.connect(lambda _c=False, rid=e.repo_id: self._resume(rid))
+            mark(btn, "primary")
+        elif e.state == "in cache":
+            btn = QPushButton("Move to library")
+            btn.setToolTip("Verify this finished model and move it out of the cache into the library")
+            btn.clicked.connect(lambda _c=False, rid=e.repo_id: self._resume(rid))
+        elif e.state == "downloading":
+            btn = QPushButton("Resume here")
+            btn.setToolTip("Another process is downloading this; this would stop waiting for it and fetch what is missing here")
+            btn.clicked.connect(lambda _c=False, rid=e.repo_id: self._resume(rid))
+        elif e.state == "ready":
+            btn = QPushButton("Open folder")
+            btn.clicked.connect(lambda _c=False, p=str(e.path): self.window._open_folder(p))
+        else:
+            return None
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        return btn
+
+    def _resume(self, repo_id: str) -> None:
+        self.window.show_download_tab()
+        self.window.start_resume(repo_id)
 
     def _selected(self) -> LibraryEntry | None:
         rows = self.table.selectionModel().selectedRows()
@@ -1147,10 +1232,19 @@ class LibraryTab(QWidget):
     def _resume_selected(self) -> None:
         e = self._selected()
         if e is not None and e.in_cache:
-            self.window.show_download_tab()
-            self.window.start_resume(e.repo_id)
+            self._resume(e.repo_id)
 
 
+# internal state keys -> what the tables say; "finished" or not is the point
+LIBRARY_LABELS = {
+    "ready": "finished",
+    "in cache": "finished, in cache",
+    "incomplete": "not finished",
+    "downloading": "downloading",
+    "moving": "moving",
+    "unverified": "unverified",
+    "in library": "finished, in library",
+}
 LIBRARY_COLORS = {
     "ready": "#1e8e3e",
     "moving": "#b06000",
@@ -1485,7 +1579,7 @@ class BrowseTab(QWidget):
         for name, color in LOCAL_COLORS.items():
             if name == "unverified":
                 continue
-            chip = QLabel(f"<span style='color:{color}'>&#9632;</span> {name}")
+            chip = QLabel(f"<span style='color:{color}'>&#9632;</span> {LIBRARY_LABELS.get(name, name)}")
             legend.addWidget(chip)
         legend.addStretch(1)
         root.addLayout(legend)
@@ -1635,7 +1729,7 @@ class BrowseTab(QWidget):
 
     @staticmethod
     def _paint_local(item: QTableWidgetItem, local: LocalState) -> None:
-        item.setText(local.state)
+        item.setText(LIBRARY_LABELS.get(local.state, local.state))
         item.setToolTip(local.note)
         color = LOCAL_COLORS.get(local.state)
         if color:
@@ -1971,7 +2065,7 @@ class ModelCardDialog(QDialog):
         local = self.window.local_state(card.repo_id)
         if local.state:
             color = LOCAL_COLORS.get(local.state, "#5f6368")
-            parts.append(f"<b style='color:{color}'>{local.state}</b>: {local.note}")
+            parts.append(f"<b style='color:{color}'>{LIBRARY_LABELS.get(local.state, local.state)}</b>: {local.note}")
         self.stats.setText("; ".join(parts))
         keys = ("license", "base_model", "pipeline_tag", "language", "tags", "datasets", "library_name", "quantized_by")
         meta_bits = [f"<b>{k}</b>: {card.meta[k][:200]}" for k in keys if card.meta.get(k)]
@@ -2012,6 +2106,101 @@ STATUS_COLORS = {
 }
 
 
+class TransferRow(QWidget):
+    """One download in the progress panel: bar, big rate, heartbeat, details and a Stop button."""
+
+    stop_requested = Signal(str)  # repo id
+
+    def __init__(self, repo_id: str, parent=None) -> None:
+        super().__init__(parent)
+        self.repo_id = repo_id
+        self.external = False
+        self.pid = 0
+        self.finished = False
+        self.stall_logged = False
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 2, 0, 2)
+        top = QHBoxLayout()
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setValue(0)
+        self.bar.setFormat("%p%")
+        self.bar.setMinimumHeight(24)
+        self.rate_label = QLabel("—")
+        font = QFont(self.rate_label.font())
+        font.setPointSize(font.pointSize() + 5)
+        font.setBold(True)
+        self.rate_label.setFont(font)
+        self.rate_label.setMinimumWidth(280)
+        self.rate_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.rate_label.setToolTip("Bytes landing in the hub cache per second, as bytes and bits")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(lambda: self.stop_requested.emit(self.repo_id))
+        mark(self.stop_btn, "danger")
+        top.addWidget(self.bar, 1)
+        top.addWidget(self.rate_label)
+        top.addWidget(self.stop_btn)
+        info = QHBoxLayout()
+        self.details = QLabel(f"{repo_id}: starting...")
+        self.details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.heartbeat = QLabel("")
+        self.heartbeat.setToolTip(
+            "Heartbeat: every second the meter checks that bytes are still landing in the cache "
+            "and that the downloading process is still alive"
+        )
+        info.addWidget(self.details, 1)
+        info.addWidget(self.heartbeat)
+        root.addLayout(top)
+        root.addLayout(info)
+
+    def update_reading(self, t: Transfer) -> str | None:
+        """Show a reading. Returns a line for the log when the heartbeat crosses a threshold."""
+        self.external, self.pid = t.external, t.pid
+        if t.external:
+            self.stop_btn.setText(f"Stop other process (pid {t.pid})" if t.pid else "Stop other process")
+            self.stop_btn.setEnabled(bool(t.pid) and psutil is not None)
+        who = f"other process (pid {t.pid}) downloading {t.repo_id}" if t.external else t.label
+        if t.total > 0:
+            self.bar.setRange(0, 1000)
+            self.bar.setValue(max(0, min(1000, int(1000 * t.done / t.total))))
+            self.bar.setFormat(f"%p%  {hff.human(t.done)} / {hff.human(t.total)}")
+        else:
+            self.bar.setRange(0, 0)
+            self.bar.setFormat(hff.human(t.done))
+        hb_text, hb_color = heartbeat_text(t)
+        self.heartbeat.setText(f"<b style='color:{hb_color}'>&#9679; {hb_text}</b>")
+        if t.final:
+            self.finished = True
+            self.rate_label.setText("—")
+            self.rate_label.setStyleSheet("")
+            self.details.setText(f"{who}: ended with {hff.human(t.done)} in the cache")
+            self.bar.setRange(0, 1000)
+            self.bar.setValue(1000 if t.total and t.done >= t.total else self.bar.value())
+            self.stop_btn.setEnabled(False)
+            return None
+        self.rate_label.setText(rate(t.speed) if t.speed > 0 else "0 B/s")
+        self.rate_label.setStyleSheet("" if t.stalled < STALL_WARN_S else f"color: {hb_color}")
+        bits = [who]
+        if t.total > 0:
+            bits.append(f"{hff.human(t.done)} of {hff.human(t.total)}")
+            if t.speed > 0 and t.done < t.total:
+                secs = int((t.total - t.done) / t.speed)
+                eta = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}" if secs >= 3600 else f"{secs // 60}:{secs % 60:02d}"
+                bits.append(f"ETA {eta}")
+        else:
+            bits.append(f"{hff.human(t.done)} so far (size not known yet)")
+        if t.down >= 0:
+            bits.append(f"network down {rate(t.down)}, up {rate(t.up)}")
+        self.details.setText("   ".join(bits))
+        if t.stalled >= STALL_ALARM_S and not self.stall_logged:
+            self.stall_logged = True
+            return f"heartbeat: no data has landed for {who} in {int(t.stalled)} s"
+        if t.stalled < STALL_WARN_S and self.stall_logged:
+            self.stall_logged = False
+            return f"heartbeat: {who} is receiving data again"
+        return None
+
+
 class _Bridge(QObject):
     """Carries meter readings from a plain thread into the GUI thread."""
 
@@ -2027,16 +2216,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1040, 760)
         self.settings = QSettings(APP_NAME, APP_NAME)
-        self.worker: Worker | None = None
+        self.workers: list[Worker] = []  # jobs running right now
+        self.queue: list[tuple[str, str]] = []  # (repo id, revision) waiting for a download slot
         self.rows: dict[str, int] = {}
-        self._download_ctx: tuple[list[str], bool] | None = None  # (repo ids, finish after) of the running download
-        self._verify_ctx: list[str] | None = None  # repo ids a verification pass is about
         self.card_dialog: ModelCardDialog | None = None
-        self.ext_meter: TransferMeter | None = None  # watching another process's download
+        self.ext_meters: dict[str, TransferMeter] = {}  # repo id -> watch on another process's download
         self.ext_bridge = _Bridge(self)
         self.ext_bridge.transfer.connect(self._on_transfer)
-        self._own_active = False  # our own download's meter is currently reporting
-        self._stall_logged = False
+        self.transfer_rows: dict[str, TransferRow] = {}
         self._build_ui()
         self._build_menu()
         self._load_settings()
@@ -2123,8 +2310,16 @@ class MainWindow(QMainWindow):
         self.clear_list_btn.clicked.connect(self.list_edit.clear)
         self.list_count = QLabel("")
         self.list_count.setEnabled(False)
+        self.parallel_spin = QSpinBox()
+        self.parallel_spin.setRange(1, 8)
+        self.parallel_spin.setValue(3)
+        self.parallel_spin.setPrefix("download ")
+        self.parallel_spin.setSuffix(" at once")
+        self.parallel_spin.setToolTip("How many models are downloaded at the same time; the rest wait in the queue")
+        self.parallel_spin.valueChanged.connect(lambda _v: self._pump_queue())
         list_btns.addWidget(self.download_all_btn)
         list_btns.addWidget(self.clear_list_btn)
+        list_btns.addWidget(self.parallel_spin)
         list_btns.addWidget(self.list_count)
         list_btns.addStretch(1)
         list_row.addWidget(self.list_edit, 1)
@@ -2210,45 +2405,12 @@ class MainWindow(QMainWindow):
         form.addRow(buttons)
         root.addWidget(fin)
 
-        # progress of the running download: bar, big rate, heartbeat, details
+        # progress of every running download, one row each (ours and other processes')
         prog_box = QGroupBox("Download progress")
-        prog = QVBoxLayout(prog_box)
-        top_row = QHBoxLayout()
-        self.xfer_bar = QProgressBar()
-        self.xfer_bar.setRange(0, 1000)
-        self.xfer_bar.setValue(0)
-        self.xfer_bar.setFormat("%p%")
-        self.xfer_bar.setMinimumWidth(220)
-        self.xfer_bar.setMinimumHeight(26)
-        self.rate_label = QLabel("—")
-        rate_font = QFont(self.rate_label.font())
-        rate_font.setPointSize(rate_font.pointSize() + 6)
-        rate_font.setBold(True)
-        self.rate_label.setFont(rate_font)
-        self.rate_label.setMinimumWidth(300)
-        self.rate_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.rate_label.setToolTip("Bytes landing in the hub cache per second, as bytes and bits")
-        self.rate_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        top_row.addWidget(self.xfer_bar, 1)
-        top_row.addWidget(self.rate_label)
-        prog.addLayout(top_row)
-        info_row = QHBoxLayout()
-        self.xfer_label = QLabel("No download running.")
-        self.xfer_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.heartbeat_label = QLabel("")
-        self.heartbeat_label.setToolTip(
-            "Heartbeat: every second the meter checks that bytes are still landing in the cache "
-            "and that the downloading process is still alive"
-        )
-        self.kill_btn = QPushButton("Stop other process")
-        self.kill_btn.setToolTip("End the other program's download of this repo so it can be resumed here")
-        self.kill_btn.clicked.connect(self._kill_external)
-        mark(self.kill_btn, "danger")
-        self.kill_btn.setVisible(False)
-        info_row.addWidget(self.xfer_label, 1)
-        info_row.addWidget(self.heartbeat_label)
-        info_row.addWidget(self.kill_btn)
-        prog.addLayout(info_row)
+        self.transfer_layout = QVBoxLayout(prog_box)
+        self.transfer_idle = QLabel("No download running.")
+        self.transfer_idle.setEnabled(False)
+        self.transfer_layout.addWidget(self.transfer_idle)
         root.addWidget(prog_box)
 
         # results: table above, log below
@@ -2337,6 +2499,7 @@ class MainWindow(QMainWindow):
         self.poll_spin.setValue(s.value("poll", 30, int))
         self.finish_after_cb.setChecked(s.value("finish_after", True, bool))
         self.list_edit.setPlainText(s.value("download_list", "", str))
+        self.parallel_spin.setValue(s.value("parallel", 3, int))
         b = self.browse
         b.search_edit.setText(s.value("browse_search", "", str))
         b.author_edit.setText(s.value("browse_author", "", str))
@@ -2366,6 +2529,7 @@ class MainWindow(QMainWindow):
         s.setValue("poll", o.poll)
         s.setValue("finish_after", self.finish_after_cb.isChecked())
         s.setValue("download_list", self.list_edit.toPlainText())
+        s.setValue("parallel", self.parallel_spin.value())
         b = self.browse
         s.setValue("browse_search", b.search_edit.text())
         s.setValue("browse_author", b.author_edit.text())
@@ -2425,9 +2589,15 @@ class MainWindow(QMainWindow):
         return answer == QMessageBox.StandardButton.Yes
 
     def download_repo(self, repo_id: str, revision: str = "") -> None:
-        """Download one repo (from the field, the Hub browser or the model card window)."""
-        if self.worker is not None:
-            QMessageBox.information(self, APP_NAME, "A job is already running. Stop it first, or add the model to the list.")
+        """Download one repo (from the field, the Hub browser or the model card window).
+
+        Downloads run side by side, up to the "at once" limit; the rest queue up.
+        """
+        if self._exclusive_running():
+            QMessageBox.information(self, APP_NAME, "A pass over the whole cache is running. Wait for it or stop it first.")
+            return
+        if repo_id in self.active_repos():
+            self.statusBar().showMessage(f"{repo_id} is already being downloaded (or waiting in the queue)", 5000)
             return
         local = self.local_state(repo_id)
         if local.downloaded and not self._confirm_redownload(repo_id, local):
@@ -2435,13 +2605,54 @@ class MainWindow(QMainWindow):
         self.show_download_tab()
         self.repo_edit.setText(repo_id)
         self.rev_edit.setText(revision)
-        opts = self._options()
-        finish_after = self.finish_after_cb.isChecked()
-        detail = f"hf download {repo_id}" + (f" --revision {revision}" if revision else "")
-        if finish_after:
-            detail += ", then hffinish " + " ".join(opts.argv(filters=[repo_id]))
-        self._download_ctx = ([repo_id], finish_after)
-        self._start(download_job(repo_id, revision, opts, finish_after), detail)
+        self._enqueue([(repo_id, revision)])
+
+    # -- the download queue
+
+    def _exclusive_running(self) -> bool:
+        return any(w.kind == "exclusive" for w in self.workers)
+
+    def active_repos(self) -> set[str]:
+        """Repos being downloaded, verified or resumed right now, plus the queue."""
+        active = {r for w in self.workers for r in w.repo_ids}
+        active.update(r for r, _rev in self.queue)
+        return active
+
+    def _downloads_in_flight(self) -> int:
+        return sum(1 for w in self.workers if w.ctx is not None and w.ctx[0] == "download")
+
+    def _enqueue(self, items: list[tuple[str, str]]) -> None:
+        if not self.workers and not self.queue:
+            self._clear_results()
+        active = self.active_repos()
+        added = 0
+        for repo_id, revision in items:
+            if repo_id in active:
+                continue
+            active.add(repo_id)
+            self.queue.append((repo_id, revision))
+            self._set_row(repo_id, "queued", "waiting for a download slot", None)
+            added += 1
+        if added > 1:
+            self.append_line(f"== {added} repos queued, {self.parallel_spin.value()} at once")
+        self._pump_queue()
+        self._set_running(bool(self.workers))
+
+    def _pump_queue(self) -> None:
+        """Start queued downloads while there are free slots."""
+        while self.queue and self._downloads_in_flight() < self.parallel_spin.value() and not self._exclusive_running():
+            repo_id, revision = self.queue.pop(0)
+            opts = self._options()
+            finish_after = self.finish_after_cb.isChecked()
+            title = f"hf download {repo_id}" + (f" --revision {revision}" if revision else "")
+            if finish_after:
+                title += ", then hffinish " + " ".join(opts.argv(filters=[repo_id]))
+            self._start(
+                download_job(repo_id, revision, opts, finish_after),
+                title,
+                repo_ids=[repo_id],
+                ctx=("download", [repo_id], finish_after),
+            )
 
     @Slot()
     def start_download_list(self) -> None:
@@ -2466,8 +2677,8 @@ class MainWindow(QMainWindow):
         if not items:
             QMessageBox.information(self, APP_NAME, "Paste one repo id or link per line into the list first.")
             return
-        if self.worker is not None:
-            QMessageBox.information(self, APP_NAME, "A job is already running. Stop it first.")
+        if self._exclusive_running():
+            QMessageBox.information(self, APP_NAME, "A pass over the whole cache is running. Wait for it or stop it first.")
             return
         opts = self._options()
         index = LocalIndex(opts.dest_path(), opts.cache_path(), opts.layout)
@@ -2496,10 +2707,8 @@ class MainWindow(QMainWindow):
                     return
             elif clicked is not again:
                 return
-        finish_after = self.finish_after_cb.isChecked()
-        self._download_ctx = ([repo_id for repo_id, _rev in items], finish_after)
-        title = f"downloading {len(items)} repo(s) from the list" + (", each verified and moved" if finish_after else "")
-        self._start(batch_job(items, opts, finish_after), title)
+        self.show_download_tab()
+        self._enqueue(items)
 
     def add_to_list(self, repo_id: str) -> None:
         """Append a repo to the list on the Download tab (from the Hub browser or the card window)."""
@@ -2524,16 +2733,28 @@ class MainWindow(QMainWindow):
         self.card_dialog.load(repo_id)
 
     def start_finish(self, dry_run: bool, title: str = "") -> None:
+        """A pass over the whole cache: runs alone."""
         opts = self._options(dry_run=dry_run)
-        self._start(finish_job(opts), (title + ": " if title else "") + "hffinish " + " ".join(opts.argv()))
+        self._start(
+            finish_job(opts),
+            (title + ": " if title else "") + "hffinish " + " ".join(opts.argv()),
+            kind="exclusive",
+            clear=True,
+        )
 
     def start_verify(self, repo_ids: str | list[str]) -> None:
-        """Check repos in the cache file by file (a dry run limited to them)."""
+        """Check repos in the cache file by file (a dry run limited to them); runs beside downloads."""
         ids = [repo_ids] if isinstance(repo_ids, str) else list(repo_ids)
+        if self._exclusive_running():
+            return
         opts = self._options(dry_run=True)
         opts.filters = ids
-        self._verify_ctx = ids
-        self._start(finish_job(opts), f"verifying {', '.join(ids)}: hffinish " + " ".join(opts.argv()))
+        self._start(
+            finish_job(opts),
+            f"verifying {', '.join(ids)}: hffinish " + " ".join(opts.argv()),
+            repo_ids=ids,
+            ctx=("verify", ids),
+        )
 
     def start_resume(self, repo_id: str, revision: str = "") -> None:
         """Pick a download up where it stopped.
@@ -2544,8 +2765,11 @@ class MainWindow(QMainWindow):
         commit, then the model is verified and moved. A repo that is not in the
         cache yet is simply downloaded.
         """
-        if self.worker is not None:
-            QMessageBox.information(self, APP_NAME, "A job is already running. Stop it first.")
+        if self._exclusive_running():
+            QMessageBox.information(self, APP_NAME, "A pass over the whole cache is running. Wait for it or stop it first.")
+            return
+        if repo_id in self.active_repos():
+            self.statusBar().showMessage(f"{repo_id} is already being worked on", 5000)
             return
         opts = self._options()
         repo_dir = opts.cache_path() / f"models--{repo_id.replace('/', '--')}"
@@ -2558,8 +2782,13 @@ class MainWindow(QMainWindow):
         opts.filters = [repo_id]
         opts.no_download = False
         opts.dry_run = False
-        self._download_ctx = ([repo_id], not opts.no_move)
-        self._start(finish_job(opts), f"resuming {repo_id}: hffinish " + " ".join(opts.argv()))
+        self._start(
+            finish_job(opts),
+            f"resuming {repo_id}: hffinish " + " ".join(opts.argv()),
+            repo_ids=[repo_id],
+            ctx=("download", [repo_id], not opts.no_move),
+            clear=not self.workers and not self.queue,
+        )
 
     @Slot()
     def start_resume_field(self) -> None:
@@ -2578,84 +2807,103 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def stop(self) -> None:
-        if self.worker is not None:
+        """Stop everything: empty the queue and cancel every running job."""
+        for repo_id, _rev in self.queue:
+            self._set_row(repo_id, "stopped", "removed from the queue", None)
+        self.queue.clear()
+        if self.workers:
             self.append_line("stopping...")
-            self.worker.cancel()
+        for w in list(self.workers):
+            w.cancel()
+        self._set_running(bool(self.workers))
 
-    def _start(self, job, title: str) -> None:
-        if self.worker is not None:
-            self.statusBar().showMessage("A job is already running; stop it first.", 5000)
+    def _stop_repo(self, repo_id: str) -> None:
+        """The Stop button of one progress row."""
+        for w in self.workers:
+            if w.current_repo == repo_id or repo_id in w.repo_ids:
+                self.append_line(f"stopping {repo_id}...")
+                w.cancel()
+                return
+        before = len(self.queue)
+        self.queue = [(r, rev) for r, rev in self.queue if r != repo_id]
+        if len(self.queue) != before:
+            self._set_row(repo_id, "stopped", "removed from the queue", None)
             return
-        self._save_settings()
+        if repo_id in self.ext_meters:
+            self._kill_external(repo_id)
+
+    def _clear_results(self) -> None:
         self.table.setRowCount(0)
         self.rows.clear()
+
+    def _start(self, job, title: str, *, kind: str = "download", repo_ids=(), ctx=None, clear: bool = False) -> Worker | None:
+        if kind == "exclusive" and (self.workers or self.queue):
+            QMessageBox.information(self, APP_NAME, "Wait for the running downloads to finish, or stop them, before a pass over the whole cache.")
+            return None
+        if self._exclusive_running():
+            self.statusBar().showMessage("A pass over the whole cache is running; wait for it or stop it.", 5000)
+            return None
+        self._save_settings()
+        if clear:
+            self._clear_results()
         self.append_line(f"== {title}")
         w = Worker(job, self._options().cache_path(), self)
+        w.kind = kind
+        w.repo_ids = list(repo_ids)
+        w.ctx = ctx
         w.line.connect(self.append_line)
         w.progress.connect(self.progress_label.setText)
         w.repos_found.connect(self._on_repos_found)
         w.repo_update.connect(self._on_repo_update)
         w.transfer.connect(self._on_transfer)
         w.external.connect(self._on_external)
-        w.done.connect(self._on_done)
-        self.worker = w
+        w.done.connect(lambda rc, w=w: self._on_done(w, rc))
+        self.workers.append(w)
         self._set_running(True)
         w.start()
+        return w
 
     # -- progress panel
 
+    def _transfer_row(self, repo_id: str) -> TransferRow:
+        row = self.transfer_rows.get(repo_id)
+        if row is not None and row.finished:
+            self._drop_transfer_row(repo_id, row)
+            row = None
+        if row is None:
+            row = TransferRow(repo_id)
+            row.stop_requested.connect(self._stop_repo)
+            self.transfer_rows[repo_id] = row
+            self.transfer_layout.addWidget(row)
+            self.transfer_idle.setVisible(False)
+        return row
+
+    def _drop_transfer_row(self, repo_id: str, row: TransferRow) -> None:
+        if self.transfer_rows.get(repo_id) is not row:
+            return  # already replaced by a newer download of the same repo
+        del self.transfer_rows[repo_id]
+        self.transfer_layout.removeWidget(row)
+        row.deleteLater()
+        if not self.transfer_rows:
+            self.transfer_idle.setVisible(True)
+
     @Slot(object)
     def _on_transfer(self, t: Transfer) -> None:
-        if not t.external:
-            self._own_active = not t.final
-        elif self._own_active:
-            return  # our own download owns the panel while it runs
-        if t.external and t.final:
-            self._external_ended(t)
-        if t.total > 0:
-            self.xfer_bar.setRange(0, 1000)
-            self.xfer_bar.setValue(max(0, min(1000, int(1000 * t.done / t.total))))
-            self.xfer_bar.setFormat(f"%p%  {hff.human(t.done)} / {hff.human(t.total)}")
-        else:
-            self.xfer_bar.setRange(0, 0)  # size unknown: busy bar
-            self.xfer_bar.setFormat(hff.human(t.done))
-        who = f"other process (pid {t.pid}) downloading {t.repo_id}" if t.external else t.label
-        hb_text, hb_color = heartbeat_text(t)
-        self.heartbeat_label.setText(f"<b style='color:{hb_color}'>&#9679; {hb_text}</b>")
+        row = self._transfer_row(t.repo_id)
+        line = row.update_reading(t)
+        if line:
+            self.append_line(line)
         if t.final:
-            self.rate_label.setText("—")
-            self.xfer_label.setText(f"{who}: ended with {hff.human(t.done)} in the cache")
-            self.xfer_bar.setRange(0, 1000)
-            self.xfer_bar.setValue(1000 if t.total and t.done >= t.total else self.xfer_bar.value())
-            self._stall_logged = False
-            return
-        self.rate_label.setText(rate(t.speed) if t.speed > 0 else "0 B/s")
-        self.rate_label.setStyleSheet("" if t.stalled < STALL_WARN_S else f"color: {hb_color}")
-        bits = [who]
-        if t.total > 0:
-            bits.append(f"{hff.human(t.done)} of {hff.human(t.total)}")
-            if t.speed > 0 and t.done < t.total:
-                secs = int((t.total - t.done) / t.speed)
-                eta = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}" if secs >= 3600 else f"{secs // 60}:{secs % 60:02d}"
-                bits.append(f"ETA {eta}")
-        else:
-            bits.append(f"{hff.human(t.done)} so far (size not known yet)")
-        if t.down >= 0:
-            bits.append(f"network down {rate(t.down)}, up {rate(t.up)}")
-        self.xfer_label.setText("   ".join(bits))
-        if t.stalled >= STALL_ALARM_S and not self._stall_logged:
-            self._stall_logged = True
-            self.append_line(f"heartbeat: no data has landed for {who} in {int(t.stalled)} s")
-        elif t.stalled < STALL_WARN_S and self._stall_logged:
-            self._stall_logged = False
-            self.append_line(f"heartbeat: {who} is receiving data again")
+            if t.external:
+                self._external_ended(t)
+            QTimer.singleShot(15000, lambda rid=t.repo_id, row=row: self._drop_transfer_row(rid, row))
 
     @Slot(str, str)
     def _on_external(self, repo_id: str, reason: str) -> None:
         """hffinish found another process downloading this repo: show that download's progress."""
-        if self.ext_meter is not None and self.ext_meter.repo_id == repo_id and self.ext_meter.is_alive():
+        current = self.ext_meters.get(repo_id)
+        if current is not None and current.is_alive():
             return
-        self.stop_external()
         m = EXT_PID_RE.search(reason)
         pid = int(m.group(1)) if m else 0
         cache = self._options().cache_path()
@@ -2680,35 +2928,35 @@ class MainWindow(QMainWindow):
         def expected() -> int:
             return cached_expected_size(repo_id, cache) or expected_size(repo_id, "")
 
-        self.ext_meter = TransferMeter(
+        meter = TransferMeter(
             self.ext_bridge.transfer.emit, repo_id, repo_id, cache, expected, alive=alive, external=True, pid=pid
         )
-        self.ext_meter.start()
-        self.kill_btn.setVisible(bool(pid) and psutil is not None)
-        self.kill_btn.setText(f"Stop other process (pid {pid})" if pid else "Stop other process")
+        self.ext_meters[repo_id] = meter
+        meter.start()
         why = re.search(r"\((.*)\)", reason)
         self.append_line(f"watching the other process's download of {repo_id} ({why.group(1) if why else reason})")
 
-    def stop_external(self) -> None:
-        if self.ext_meter is not None:
-            self.ext_meter.stop(final=False)
-            self.ext_meter = None
-        self.kill_btn.setVisible(False)
+    def stop_external(self, repo_id: str | None = None) -> None:
+        """Stop watching one repo's external download, or all of them (no closing reading is shown)."""
+        ids = [repo_id] if repo_id else list(self.ext_meters)
+        for rid in ids:
+            meter = self.ext_meters.pop(rid, None)
+            if meter is not None:
+                meter.stop(final=False)
 
     def _external_ended(self, t: Transfer) -> None:
-        if self.ext_meter is not None and self.ext_meter.repo_id != t.repo_id:
-            return  # a reading from a watch that was already replaced
-        self.ext_meter = None
-        self.kill_btn.setVisible(False)
+        meter = self.ext_meters.get(t.repo_id)
+        if meter is None or meter.pid != t.pid:
+            return  # a reading from a watch that was already replaced or stopped
+        del self.ext_meters[t.repo_id]
         self.append_line(f"the other process's download of {t.repo_id} has ended ({hff.human(t.done)} in the cache); verifying")
         self.library.refresh()
         self.browse.refresh_local()
-        if self.worker is None:
+        if not self._exclusive_running() and t.repo_id not in self.active_repos():
             QTimer.singleShot(0, lambda: self.start_verify(t.repo_id))
 
-    @Slot()
-    def _kill_external(self) -> None:
-        meter = self.ext_meter
+    def _kill_external(self, repo_id: str) -> None:
+        meter = self.ext_meters.get(repo_id)
         if meter is None or not meter.pid or psutil is None:
             return
         answer = QMessageBox.question(
@@ -2731,32 +2979,31 @@ class MainWindow(QMainWindow):
         except psutil.Error as exc:
             self.append_line(f"could not stop process {meter.pid}: {exc}")
 
-    @Slot(int)
-    def _on_done(self, rc: int) -> None:
-        w = self.worker
-        self.worker = None
-        if w is not None:
-            w.wait(2000)
-            w.deleteLater()
-        self._set_running(False)
+    def _on_done(self, w: Worker, rc: int) -> None:
+        if w in self.workers:
+            self.workers.remove(w)
+        w.wait(2000)
+        w.deleteLater()
         text = {0: "finished", 1: "finished with problems, see the log", 2: "could not start, see the log", 130: "stopped"}
-        self.statusBar().showMessage(text.get(rc, f"finished with exit code {rc}"), 15000)
-        self.append_line(f"== {text.get(rc, f'exit code {rc}')}")
+        what = f" ({', '.join(w.repo_ids)})" if w.repo_ids else ""
+        self.statusBar().showMessage(text.get(rc, f"finished with exit code {rc}") + what, 15000)
+        self.append_line(f"== {text.get(rc, f'exit code {rc}')}{what}")
 
-        download_ctx, self._download_ctx = self._download_ctx, None
-        verify_ctx, self._verify_ctx = self._verify_ctx, None
-        if download_ctx is not None:
-            repo_ids, finish_after = download_ctx
+        ctx = w.ctx
+        if ctx is not None and ctx[0] == "download":
+            _kind, repo_ids, finish_after = ctx
             if not (finish_after and rc == 0):
                 # the download stopped, failed, or was not followed by the finish pass:
                 # check what is actually on disk before anyone trusts it
-                QTimer.singleShot(0, lambda: self.start_verify(repo_ids))
-                return
-        elif verify_ctx is not None:
-            for repo_id in verify_ctx:
+                self.start_verify(repo_ids)
+        elif ctx is not None and ctx[0] == "verify":
+            for repo_id in ctx[1]:
                 self._report_verification(repo_id)
-        self.library.refresh()
-        self.browse.refresh_local()
+        self._pump_queue()
+        self._set_running(bool(self.workers))
+        if not self.workers:
+            self.library.refresh()
+            self.browse.refresh_local()
 
     def _report_verification(self, repo_id: str) -> None:
         row = self.rows.get(repo_id)
@@ -2772,35 +3019,22 @@ class MainWindow(QMainWindow):
             self.append_line(f"verified: {repo_id} is {status}: {note}")
 
     def _set_running(self, running: bool) -> None:
-        for wdg in (
-            self.download_btn,
-            self.resume_btn,
-            self.download_all_btn,
-            self.scan_btn,
-            self.run_btn,
-            self.repo_edit,
-            self.rev_edit,
-        ):
-            wdg.setEnabled(not running)
-        self.stop_btn.setEnabled(running)
+        exclusive = self._exclusive_running()
+        # downloads may be added while other downloads run, but not during a pass over the whole cache
+        for wdg in (self.download_btn, self.resume_btn, self.download_all_btn, self.repo_edit, self.rev_edit):
+            wdg.setEnabled(not exclusive)
+        # a pass over the whole cache needs the cache to itself
+        for wdg in (self.scan_btn, self.run_btn):
+            wdg.setEnabled(not self.workers and not self.queue)
+        self.stop_btn.setEnabled(running or bool(self.queue))
         self.busy.setVisible(running)
-        watching = self.ext_meter is not None and self.ext_meter.is_alive()
-        if running and not watching:
-            self.xfer_bar.setRange(0, 1000)
-            self.xfer_bar.setValue(0)
-            self.xfer_bar.setFormat("%p%")
-            self.rate_label.setText("—")
-            self.heartbeat_label.setText("")
-            self.xfer_label.setText("Waiting for a download to start...")
-        elif not running:
+        if not running:
             self.progress_label.setText("")
-            self._own_active = False
-            if not watching:
-                if self.xfer_bar.maximum() == 0:
-                    self.xfer_bar.setRange(0, 1000)
-                if self.xfer_label.text().startswith("Waiting"):
-                    self.xfer_label.setText("No download running.")
-                    self.heartbeat_label.setText("")
+        n = self._downloads_in_flight()
+        if n or self.queue:
+            self.transfer_idle.setText(f"{n} download(s) running, {len(self.queue)} queued")
+        else:
+            self.transfer_idle.setText("No download running.")
 
     @Slot(int)
     def _tab_changed(self, index: int) -> None:
@@ -2879,19 +3113,23 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
-        if self.worker is not None:
+        if self.workers or self.queue:
+            n = len(self.workers)
             answer = QMessageBox.question(
                 self,
                 APP_NAME,
-                "A job is still running. Stop it and quit?",
+                f"{n} job(s) are still running" + (f" and {len(self.queue)} queued" if self.queue else "") + ". Stop them and quit?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self.worker.cancel()
-            self.worker.wait(5000)
+            self.queue.clear()
+            for w in self.workers:
+                w.cancel()
+            for w in self.workers:
+                w.wait(5000)
         if self.library.scanner is not None:
             self.library.scanner.wait(5000)
         if self.browse.worker is not None:
