@@ -88,7 +88,7 @@ except ImportError:  # pragma: no cover - Qt's own Markdown renderer is the fall
     _markdown = None  # type: ignore[assignment]
 
 APP_NAME = "HF-Downloader"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 WINDOWS = os.name == "nt"
 HUB_URL = "https://huggingface.co"
 
@@ -223,11 +223,14 @@ def parse_repo_list(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, s
     """Parse a pasted list, one repo per line, in any form parse_repo_ref accepts.
 
     Returns (accepted [(repo_id, revision)], rejected [(line, reason)]). Blank
-    lines and lines starting with '#' are skipped; a repo listed twice is kept once.
+    lines and lines starting with '#' are skipped; a repo listed twice (in any
+    form, any letter case, with or without a revision) is kept once, the first
+    time it appears: the Hub treats ids case-insensitively and two downloads of
+    one repo would fight over the same cache folder.
     """
     accepted: list[tuple[str, str]] = []
     rejected: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
     for raw in text.splitlines():
         line = raw.strip().rstrip(",;")
         if not line or line.startswith("#"):
@@ -237,13 +240,42 @@ def parse_repo_list(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, s
         except ValueError as exc:
             rejected.append((line, str(exc)))
             continue
-        if ref not in seen:
-            seen.add(ref)
+        key = ref[0].lower()
+        if key not in seen:
+            seen.add(key)
             accepted.append(ref)
     return accepted, rejected
 
 
 # --------------------------------------------------------------------------- transfer meter
+
+# The heartbeat has two sources. The downloader's own byte count ("hf": what
+# `hf download --format human` prints, parsed from its output) moves with every
+# chunk received from the network. Without it only the files in the cache can
+# be watched ("disk"), and the xet downloader writes those in steps of 64 MB
+# with minutes of silence in between (measured here: 1-2 min at 1 MB/s), so
+# the thresholds are far longer then; a false stall would throw a download away.
+STALL_WARN_S = 20  # "hf": no bytes for this long is shown as a warning
+STALL_ALARM_S = 90  # shown in older notes; a restart at this point killed quiet-but-live xet transfers
+STALL_WARN_DISK_S = 180  # "disk": warning when only the cache can be watched
+STALL_ALARM_DISK_S = 600  # restart only after this long with no new bytes (xet is often quiet for 1-2 min)
+STALL_RESTART_WAIT_S = 1  # a restart after a stall is immediate: nothing failed, the connection just went quiet
+
+
+def restart_due(silent_s: float, stopped: bool = False) -> bool:
+    """True when our own download should be killed and started again.
+
+    Warnings fire earlier. The restart itself waits out the long disk
+    threshold, whatever the downloader has printed: xet writes the cache in
+    64 MB steps and is silent for a minute or two between them. Restarting
+    at 90 s deleted the partial file of a transfer that was still going.
+    """
+    if stopped:
+        return False
+    return silent_s >= STALL_ALARM_DISK_S
+DISK_RATE_WINDOW_S = 300  # "disk": the rate is the average over this many seconds (it lands in 64 MB steps)
+MAX_FAILED_RESTARTS = 5  # a download that keeps exiting with an error (not a stall) is given up after this many
+MAX_CHECKSUM_ROUNDS = 3  # files whose hash does not match are fetched again, this many times at most
 
 
 @dataclass
@@ -251,23 +283,22 @@ class Transfer:
     """One reading of a running download, shown in the progress panel."""
 
     label: str  # "[2/5] org/name" or "org/name"
-    done: int  # bytes of the repo in the cache
+    done: int  # bytes of the repo in the cache (or written, as the downloader counts them, if more)
     total: int  # bytes the repo should have (0 = unknown)
-    speed: float  # bytes/s landing in the cache (smoothed)
+    speed: float  # bytes/s: received from the network as the downloader counts them, or landing in the cache
     down: float  # machine-wide network bytes/s received (psutil), -1 if unavailable
     up: float  # machine-wide network bytes/s sent, -1 if unavailable
     final: bool = False
-    stalled: float = 0.0  # seconds since the last byte landed on disk (the heartbeat)
+    stalled: float = 0.0  # seconds since the last byte was received or landed on disk (the heartbeat)
     alive: bool = True  # the downloading process still exists
     external: bool = False  # another process's download, watched rather than run by us
     pid: int = 0
     repo_id: str = ""
-
-
-STALL_WARN_S = 20  # heartbeat: no bytes for this long is shown as a warning
-STALL_ALARM_S = 90  # ... and for this long as a stall: our own downloads are restarted at this point
-MAX_FAILED_RESTARTS = 5  # a download that keeps exiting with an error (not a stall) is given up after this many
-MAX_CHECKSUM_ROUNDS = 3  # files whose hash does not match are fetched again, this many times at most
+    received: int = 0  # bytes received from the network as the downloader counts them (0 = not reported)
+    files: str = ""  # "3/8 files" as the downloader reports it
+    source: str = "disk"  # what the rate and the heartbeat are based on: "hf" or "disk" (see above)
+    warn_s: int = STALL_WARN_DISK_S  # the heartbeat thresholds in force for this reading
+    alarm_s: int = STALL_ALARM_DISK_S
 
 
 def heartbeat_text(t: "Transfer") -> tuple[str, str]:
@@ -276,9 +307,9 @@ def heartbeat_text(t: "Transfer") -> tuple[str, str]:
         return ("finished" if t.alive else "process ended", "#5f6368")
     if not t.alive:
         return ("process gone", "#c5221f")
-    if t.stalled >= STALL_ALARM_S:
+    if t.stalled >= t.alarm_s:
         return (f"stalled: no data for {int(t.stalled) // 60}:{int(t.stalled) % 60:02d}", "#c5221f")
-    if t.stalled >= STALL_WARN_S:
+    if t.stalled >= t.warn_s:
         return (f"no data for {int(t.stalled)} s", "#b06000")
     return ("receiving data", "#1e8e3e")
 
@@ -327,6 +358,167 @@ def kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+# Windows: a job that kills every process in it when the handle is closed.
+# hf.exe is a launcher. If it exits while a child still holds the output pipe,
+# the reader blocks and the meter used to treat the download as gone, so nothing
+# ever killed that child. Assigning the launcher to the job at start puts later
+# children in the job too; closing the handle ends the ones that outlived it.
+_JOB_KILL_ON_CLOSE = 0x2000
+_JOB_EXTENDED_LIMIT = 9
+
+
+def _job_limit_buffer():
+    """The extended job-limit struct, or None when this process is not 64-bit Windows.
+
+    The 64-bit layout has padding the ctypes default would get wrong. A wrong
+    size makes SetInformationJobObject fail, and then we fall back to taskkill.
+    """
+    import ctypes
+
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        return None
+
+    class Basic(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", ctypes.c_uint32),
+            ("_pad0", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("_pad1", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", Basic),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    if ctypes.sizeof(Extended) != 144:
+        return None
+    info = Extended()
+    info.BasicLimitInformation.LimitFlags = _JOB_KILL_ON_CLOSE
+    return info
+
+
+def _kernel32():
+    import ctypes
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    k.CreateJobObjectW.restype = ctypes.c_void_p
+    k.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    k.SetInformationJobObject.restype = ctypes.c_int
+    k.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    k.AssignProcessToJobObject.restype = ctypes.c_int
+    k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k.OpenProcess.restype = ctypes.c_void_p
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    k.CloseHandle.restype = ctypes.c_int
+    return k
+
+
+def _assign_job(proc: subprocess.Popen):
+    """A job handle that ends this process and the children it has already spawned, or None."""
+    if not WINDOWS:
+        return None
+    info = _job_limit_buffer()
+    if info is None:
+        return None
+    try:
+        import ctypes
+
+        k = _kernel32()
+        job = k.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        if not k.SetInformationJobObject(job, _JOB_EXTENDED_LIMIT, ctypes.byref(info), ctypes.sizeof(info)):
+            k.CloseHandle(job)
+            return None
+        handle = getattr(proc, "_handle", None)
+        if not handle or not k.AssignProcessToJobObject(job, handle):
+            k.CloseHandle(job)
+            return None
+        # Anything spawned in the gap before the assign is not in the job yet.
+        if psutil is not None:
+            try:
+                parent = psutil.Process(proc.pid)
+                for child in parent.children(recursive=True):
+                    opened = k.OpenProcess(0x0101, 0, child.pid)  # PROCESS_TERMINATE | PROCESS_SET_QUOTA
+                    if not opened:
+                        continue
+                    try:
+                        k.AssignProcessToJobObject(job, opened)
+                    finally:
+                        k.CloseHandle(opened)
+            except (psutil.Error, OSError):
+                pass
+        return job
+    except (OSError, AttributeError):
+        return None
+
+
+def _close_job(job) -> None:
+    """Close a job handle. With KILL_ON_JOB_CLOSE that ends every process still in it."""
+    if not job:
+        return
+    try:
+        _kernel32().CloseHandle(job)
+    except (OSError, AttributeError):
+        pass
+
+
+def _job_pids(job) -> list[int]:
+    """Pids currently in a job. Empty when the job is gone or the query is unavailable."""
+    if not job or not WINDOWS:
+        return []
+    try:
+        import ctypes
+
+        class IdList(ctypes.Structure):
+            _fields_ = [
+                ("NumberOfAssignedProcesses", ctypes.c_uint32),
+                ("NumberOfProcessIdsInList", ctypes.c_uint32),
+                ("ProcessIdList", ctypes.c_size_t * 256),
+            ]
+
+        info = IdList()
+        k = _kernel32()
+        k.QueryInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        k.QueryInformationJobObject.restype = ctypes.c_int
+        if not k.QueryInformationJobObject(job, 3, ctypes.byref(info), ctypes.sizeof(info), None):
+            return []
+        count = min(int(info.NumberOfProcessIdsInList), 256)
+        return [int(info.ProcessIdList[i]) for i in range(count) if int(info.ProcessIdList[i])]
+    except (OSError, AttributeError):
+        return []
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -355,6 +547,75 @@ def rate(bytes_per_s: float) -> str:
     return f"{hff.human(bytes_per_s)}/s ({bit_text})"
 
 
+# --------------------------------------------------------------------------- the downloader's own counters
+
+# `hf download --format human` (huggingface_hub 2.x) redraws three lines while it runs:
+#   Downloading bytes: ███▌      | 6.31MB, 2.13MB/s            bytes received from the network, and the rate
+#   Reconstructing (incomplete total...):  0%|   |  0.00B / 17.8MB    bytes written to the cache / repo size
+#   Fetching 5 files:  20%|██        | 1/5 [00:00<00:01,  2.42it/s]
+# ending in "Download complete: ...| 16.9MB, 2.58MB/s" and "Reconstruction complete: 100%|...".
+# tqdm scales with 1000 (kB, MB, GB); "KiB" and the like would be 1024.
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_SIZE = r"(\d+(?:\.\d+)?)\s*([kKMGTPE]?i?B)"
+TRANSFER_RE = re.compile(rf"^Download(?:ing bytes| complete)[^|]*\|\s*{_SIZE}(?:,\s*{_SIZE}/s)?")
+RECON_RE = re.compile(rf"^Reconstruct[^|]*\|[^|]*\|\s*{_SIZE}\s*/\s*{_SIZE}(?:,\s*{_SIZE}/s)?")
+FILES_RE = re.compile(r"^Fetching (\d+) files:\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)")
+BAR_GLYPHS_RE = re.compile(r"[█-▏]+")
+_UNIT = {"": 1, "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15, "E": 1e18}
+
+
+def parse_size(num: str, unit: str) -> int:
+    """'6.31', 'MB' -> 6310000; '1.5', 'GiB' -> 1610612736."""
+    prefix = unit[:-1]
+    if prefix.endswith("i"):
+        return int(float(num) * 1024 ** ("KMGTPE".index(prefix[0].upper()) + 1))
+    return int(float(num) * _UNIT.get(prefix, 1))
+
+
+@dataclass
+class HfProgress:
+    """What the downloader has reported so far about one download attempt."""
+
+    received: int = 0  # bytes from the network
+    rate: float = 0.0  # bytes/s as the downloader computes it (0 = not printed)
+    written: int = 0  # bytes reconstructed into the cache
+    total: int = 0  # repo bytes as far as the downloader knows (grows while files are discovered)
+    files_done: int = 0
+    files: int = 0
+    received_t: float = 0.0  # monotonic time the received count last grew
+    seen_t: float = 0.0  # monotonic time of the last progress line
+
+    def copy(self) -> "HfProgress":
+        return HfProgress(**self.__dict__)
+
+
+def parse_hf_progress(segment: str, p: HfProgress, now: float) -> bool:
+    """Update p from one progress line of `hf download --format human`; False if it was something else."""
+    text = ANSI_RE.sub("", segment).strip()
+    m = TRANSFER_RE.match(text)
+    if m:
+        received = parse_size(m.group(1), m.group(2))
+        if received > p.received:
+            p.received_t = now
+        p.received = max(p.received, received)
+        if m.group(3):
+            p.rate = parse_size(m.group(3), m.group(4))
+        p.seen_t = now
+        return True
+    m = RECON_RE.match(text)
+    if m:
+        p.written = parse_size(m.group(1), m.group(2))
+        p.total = max(p.total, parse_size(m.group(3), m.group(4)))
+        p.seen_t = now
+        return True
+    m = FILES_RE.match(text)
+    if m:
+        p.files_done, p.files = int(m.group(2)), int(m.group(3))
+        p.seen_t = now
+        return True
+    return False
+
+
 class TransferMeter(threading.Thread):
     """Measures a download once a second: bytes of the repo on disk and network throughput.
 
@@ -373,7 +634,8 @@ class TransferMeter(threading.Thread):
         alive=None,  # callable -> bool; the meter ends by itself once it returns False
         external: bool = False,
         pid: int = 0,
-        on_stall=None,  # callable(seconds) fired once when no byte has landed for STALL_ALARM_S
+        on_stall=None,  # callable(seconds) fired once when nothing has arrived for the alarm threshold
+        reported=None,  # callable -> HfProgress | None: the downloader's own counters, when it prints them
     ) -> None:
         super().__init__(daemon=True, name="transfer-meter")
         self.emit = emit
@@ -385,6 +647,7 @@ class TransferMeter(threading.Thread):
         self.external = external
         self.pid = pid
         self.on_stall = on_stall
+        self.reported = reported
         self._stop = threading.Event()
         self._final_on_stop = True
 
@@ -393,10 +656,18 @@ class TransferMeter(threading.Thread):
         self._final_on_stop = final
         self._stop.set()
 
-    def _reading(self, done: int, total: int, speed: float, down: float, up: float, stalled: float, alive: bool, final=False) -> Transfer:
+    def _reading(self, done: int, total: int, speed: float, down: float, up: float, stalled: float, alive: bool, final=False, **extra) -> Transfer:
         return Transfer(
-            self.label, done, total, speed, down, up, final, stalled, alive, self.external, self.pid, self.repo_id
+            self.label, done, total, speed, down, up, final, stalled, alive, self.external, self.pid, self.repo_id, **extra
         )
+
+    def _reported(self) -> HfProgress | None:
+        if self.reported is None:
+            return None
+        try:
+            return self.reported()
+        except Exception:  # noqa: BLE001 - the meter must outlive any parsing trouble
+            return None
 
     def _emit(self, reading: Transfer) -> None:
         try:
@@ -440,6 +711,11 @@ class TransferMeter(threading.Thread):
         total = 0
         stall_fired = False
         no_net = -1.0 if net is None else 0.0
+        history: list[tuple[float, int]] = [(last_t, last)]  # (time, bytes on disk) over DISK_RATE_WINDOW_S
+        last_received = 0
+        last_written = 0
+        received_rate = 0.0
+        extra: dict = {}
         self._emit(self._reading(last, total, 0.0, no_net, no_net, 0.0, alive))
         if callable(self.expected):
             try:
@@ -452,36 +728,73 @@ class TransferMeter(threading.Thread):
             now = time.monotonic()
             cur = self.measure()
             dt = max(now - last_t, 1e-3)
-            if cur != last:
+            rep = self._reported()
+            received = rep.received if rep is not None else 0
+            written = rep.written if rep is not None else 0
+            # Heartbeat: bytes received, bytes reconstructed, or bytes on disk.
+            # A progress line that repeats the same numbers is not one — a frozen
+            # bar would otherwise never count as stalled.
+            if cur != last or received != last_received or written != last_written:
                 changed_t = now
                 stall_fired = False
-            elif self.on_stall is not None and not stall_fired and now - changed_t >= STALL_ALARM_S:
+            if rep is not None and rep.received_t > 0:
+                # the downloader counts what it receives: its own rate when it prints one,
+                # otherwise the count's growth per second; nothing received for 5 s reads as 0
+                inst = max(received - last_received, 0) / dt
+                received_rate = inst if received_rate == 0 else 0.5 * received_rate + 0.5 * inst
+                speed = rep.rate if rep.rate > 0 else received_rate
+                if now - rep.received_t >= 5 and written == last_written and cur == last:
+                    speed = 0.0
+                warn_s = STALL_WARN_S
+                extra = {"received": received, "source": "hf"}
+            else:
+                # only the cache can be watched: the average over the last minutes, since the
+                # downloader writes files in 64 MB steps (an instantaneous figure would be 0 or huge)
+                history.append((now, cur))
+                while len(history) > 2 and now - history[0][0] > DISK_RATE_WINDOW_S:
+                    history.pop(0)
+                t0, b0 = history[0]
+                speed = max(cur - b0, 0) / max(now - t0, 1.0)
+                if now - changed_t >= STALL_WARN_DISK_S:
+                    speed = 0.0
+                warn_s = STALL_WARN_DISK_S
+                extra = {"source": "disk"}
+            # The red "stalled" state and the restart are the same long threshold.
+            # A 90 s cutoff, once any byte counter had been seen, was shorter than
+            # xet's silence and the restart threw the partial file away.
+            alarm_s = STALL_ALARM_DISK_S
+            if rep is not None and rep.files:
+                extra["files"] = f"{rep.files_done}/{rep.files} files"
+            extra["warn_s"], extra["alarm_s"] = warn_s, alarm_s
+            silent = now - changed_t
+            if self.on_stall is not None and not stall_fired and restart_due(silent):
                 stall_fired = True
                 try:
-                    self.on_stall(now - changed_t)
+                    self.on_stall(silent)
                 except Exception:  # noqa: BLE001 - the watchdog must never kill the meter
                     pass
-            inst = max(cur - last, 0) / dt
-            speed = inst if speed == 0 else 0.7 * speed + 0.3 * inst
-            if now - changed_t >= 3:
-                speed = 0.0  # nothing landed for a while: say so instead of decaying slowly
+            last_written = written
             down = up = -1.0
             net2 = self._net()
             if net is not None and net2 is not None:
                 down = max(net2.bytes_recv - net.bytes_recv, 0) / dt
                 up = max(net2.bytes_sent - net.bytes_sent, 0) / dt
             net = net2
-            last_t, last = now, cur
+            last_t, last, last_received = now, cur, received
             if self.alive is not None:
                 try:
                     alive = bool(self.alive())
                 except Exception:  # noqa: BLE001
                     alive = True
-            self._emit(self._reading(cur, total, speed, down, up, now - changed_t, alive))
+            done = max(cur, rep.written if rep is not None else 0)
+            shown_total = total or (rep.total if rep is not None else 0)
+            self._emit(self._reading(done, shown_total, speed, down, up, now - changed_t, alive, **extra))
             if not alive:
                 break
         if not alive or self._final_on_stop:
-            self._emit(self._reading(self.measure(), total, 0.0, -1.0, -1.0, 0.0, alive, final=True))
+            rep = self._reported()
+            done = max(self.measure(), rep.written if rep is not None else 0)
+            self._emit(self._reading(done, total, 0.0, -1.0, -1.0, 0.0, alive, final=True, **extra))
 
 
 def remove_stale_partials(repo_id: str, cache_dir: Path) -> int:
@@ -624,6 +937,8 @@ def hash_tree(root: Path, files: list[FileCheck], stage: str, w: "Worker", repo_
             start = done_total
 
             def prog(b: int, start=start) -> None:
+                if w.cancelled:
+                    raise KeyboardInterrupt
                 w.progress.emit(f"{repo_id}: {label}  {hff.human(start + b)} / {hff.human(total)}")
 
             digest = hash_file(p, f.algo, f.size, prog)
@@ -763,34 +1078,48 @@ class QueueItem:
 
 
 class _LineSplitter:
-    """File-like sink: '\\n' ends a log line, '\\r' is a progress update (tqdm style)."""
+    """File-like sink: '\\n' ends a log line, '\\r' is a progress update (tqdm style).
 
-    def __init__(self, worker: "Worker") -> None:
+    The downloader's own progress lines (see parse_hf_progress) go to the
+    worker's counters instead of the log; it redraws several of them with
+    "\\r" and "\\n" in between, so an empty segment before a "\\n" is part of
+    that dance and not a blank line.
+    """
+
+    def __init__(self, worker: "Worker", generation: int | None = None) -> None:
         self.worker = worker
+        self.generation = generation
         self.buf = ""
-        self.last_progress = ""
+
+    # "\r\n" is a Windows line end, a lone "\r" a progress redraw, "\x1b[A" tqdm's
+    # "cursor up" between its lines (it ends a segment too)
+    SEPARATORS = ("\r\n", "\n", "\r", "\x1b[A")
 
     def write(self, text: str) -> int:
         if not text:
             return 0
+        # A reader left behind by a restart must not feed the next attempt's counters.
+        if self.generation is not None and self.generation != getattr(self.worker, "_output_gen", self.generation):
+            return len(text)
         self.buf += text
         while True:
-            cuts = [i for i in (self.buf.find("\n"), self.buf.find("\r")) if i >= 0]
+            cuts = [(i, -len(s), s) for s in self.SEPARATORS for i in (self.buf.find(s),) if i >= 0]
             if not cuts:
                 break
-            i = min(cuts)
-            seg, sep, self.buf = self.buf[:i], self.buf[i], self.buf[i + 1 :]
-            if sep == "\n":
-                line = seg.rstrip()
-                if not line and self.last_progress:
-                    line = self.last_progress  # "\r...100%\n": keep the final state in the log
-                self.last_progress = ""
-                if line:
-                    self.worker.line.emit(line)
+            i, _neg, sep = min(cuts)
+            if sep == "\r" and i == len(self.buf) - 1:
+                break  # a "\n" may follow in the next chunk; wait and see
+            seg, self.buf = self.buf[:i], self.buf[i + len(sep) :]
+            seg = ANSI_RE.sub("", seg).rstrip()
+            if not seg.strip():
+                continue
+            if self.worker.note_progress(seg):
+                continue
+            if sep in ("\n", "\r\n"):
+                self.worker.line.emit(seg)
                 self.worker.progress.emit("")
-            elif seg.strip():
-                self.last_progress = seg.rstrip()
-                self.worker.progress.emit(self.last_progress)
+            else:
+                self.worker.progress.emit(seg)
         return len(text)
 
     def flush(self) -> None:
@@ -831,6 +1160,13 @@ def _hook_process(repo, *args) -> None:
     return w._process(repo, *args)
 
 
+def _hook_sleep(seconds: float) -> None:
+    w = getattr(_current, "worker", None)
+    if w is None:
+        return _ORIG["sleep_poll"](seconds)
+    w._sleep(seconds)
+
+
 class _ThreadStdout:
     """sys.stdout/sys.stderr replacement: a worker thread's output goes to its own sink."""
 
@@ -867,8 +1203,8 @@ class _ThreadStdout:
 def install_hooks() -> None:
     if _ORIG:
         return
-    _ORIG.update(log=hff.log, run_download=hff.run_download, process=hff.process)
-    hff.log, hff.run_download, hff.process = _hook_log, _hook_run_download, _hook_process
+    _ORIG.update(log=hff.log, run_download=hff.run_download, process=hff.process, sleep_poll=hff.sleep_poll)
+    hff.log, hff.run_download, hff.process, hff.sleep_poll = _hook_log, _hook_run_download, _hook_process, _hook_sleep
     sys.stdout = _ThreadStdout(sys.stdout)
     sys.stderr = _ThreadStdout(sys.stderr)
 
@@ -905,8 +1241,15 @@ class Worker(QThread):
         self._cancel = threading.Event()
         self._stall_restart = False  # the heartbeat killed the download because it stalled
         self._proc: subprocess.Popen | None = None
+        self._job = None  # Windows job whose close kills the download and its children
+        self._child_pids: list[tuple[int, float]] = []  # (pid, create time) seen while the launcher was alive
+        self._reader: threading.Thread | None = None
+        self._output_gen = 0  # bumped per attempt so a late reader cannot feed the next one
         self._lock = threading.Lock()
         self._meter: TransferMeter | None = None
+        self.hf_progress: HfProgress | None = None  # the downloader's own counters for the current attempt
+        self._progress_lock = threading.Lock()
+        self._logged_progress: set[str] = set()
 
     # -- control
 
@@ -914,8 +1257,8 @@ class Worker(QThread):
         self._cancel.set()
         with self._lock:
             proc = self._proc
-        if proc is not None and proc.poll() is None:
-            kill_tree(proc)
+        if proc is not None:
+            self._end_process(proc)
 
     @property
     def cancelled(self) -> bool:
@@ -926,6 +1269,8 @@ class Worker(QThread):
     def start_meter(self, repo_id: str, expected: int) -> None:
         self.stop_meter()
         self.current_repo = repo_id
+        with self._progress_lock:
+            self.hf_progress = HfProgress()
         self._meter = TransferMeter(
             self.transfer.emit,
             repo_id,
@@ -934,26 +1279,178 @@ class Worker(QThread):
             expected or (lambda: cached_expected_size(repo_id, self.cache_dir)),
             alive=self._download_alive,
             on_stall=self._on_stall,
+            reported=self._reported,
         )
         self._meter.start()
 
+    def _reported(self) -> HfProgress | None:
+        """A copy of the downloader's counters for the meter thread (None until it printed anything)."""
+        with self._progress_lock:
+            p = self.hf_progress
+            return p.copy() if p is not None and p.seen_t > 0 else None
+
+    def note_progress(self, segment: str) -> bool:
+        """One output segment of the download command (worker thread): the downloader's own
+        progress line is parsed into the counters and not logged; anything else returns False."""
+        now = time.monotonic()
+        with self._progress_lock:
+            p = self.hf_progress
+            if p is None:
+                p = self.hf_progress = HfProgress()
+            if not parse_hf_progress(segment, p, now):
+                return False
+        text = " ".join(BAR_GLYPHS_RE.sub("", ANSI_RE.sub("", segment)).split())
+        if text.startswith(("Download complete", "Reconstruction complete")):
+            if text not in self._logged_progress:  # the final state of each counter, once
+                self._logged_progress.add(text)
+                self.line.emit(text)
+        elif text.startswith("Downloading bytes"):
+            self.progress.emit(text)
+        return True
+
+    def note_bar(self, desc: str, n: int, total: int) -> None:
+        """Counters of an in-process download (see in_process_bar_class)."""
+        now = time.monotonic()
+        with self._progress_lock:
+            p = self.hf_progress
+            if p is None:
+                p = self.hf_progress = HfProgress()
+            if desc.startswith("Download"):
+                if n > p.received:
+                    p.received_t = now
+                p.received = max(p.received, n)
+            elif desc.startswith("Reconstruct"):
+                p.written = n
+                p.total = max(p.total, total)
+            elif desc.startswith("Fetching"):
+                p.files_done, p.files = n, total
+            else:
+                return
+            p.seen_t = now
+
+    def in_process_bar_class(self):
+        """A tqdm replacement for snapshot_download: prints nothing, but feeds the meter the
+        same counters `hf download` prints (bytes received, bytes written, files)."""
+        from tqdm.std import tqdm as _tqdm
+
+        worker = self
+
+        class Bar(_tqdm):
+            def __init__(self, *args, **kwargs):
+                self._hf_desc = str(kwargs.get("desc") or "")
+                kwargs["disable"] = True
+                kwargs.pop("name", None)
+                super().__init__(*args, **kwargs)
+
+            def update(self, n=1):
+                self.n = (self.n or 0) + (n or 0)
+                worker.note_bar(self._hf_desc, int(self.n), int(self.total or 0))
+                return True
+
+        return Bar
+
     def _download_alive(self) -> bool:
-        """Heartbeat for our own download: the child process is still there (in-process
-        downloads have no child, so they count as alive until the job returns)."""
+        """True while the download can still be producing output.
+
+        The launcher (`hf.exe`) often exits as soon as it has spawned Python.
+        Treating that as "process gone" stopped the meter, and the child kept
+        the pipe open with nobody left to notice it had stalled.
+        """
         with self._lock:
             proc = self._proc
-        return proc is None or proc.poll() is None
+            reader = self._reader
+        if proc is None:
+            return True  # not started yet, or an in-process call with no child
+        if proc.poll() is None:
+            return True
+        return reader is not None and reader.is_alive()
+
+    def _take_job(self):
+        with self._lock:
+            job = self._job
+            self._job = None
+            return job
+
+    def _note_children(self, proc: subprocess.Popen) -> None:
+        """Remember descendants while the launcher is still alive.
+
+        Once it exits they are reparented and no longer show up as its children,
+        which is how a download used to keep running with nobody able to stop it.
+        """
+        if psutil is None or proc.poll() is not None:
+            return
+        found: list[tuple[int, float]] = []
+        try:
+            for child in psutil.Process(proc.pid).children(recursive=True):
+                try:
+                    found.append((child.pid, child.create_time()))
+                except psutil.Error:
+                    continue
+        except psutil.Error:
+            return
+        with self._lock:
+            self._child_pids = found
+
+    def _children_alive(self) -> list[int]:
+        """Descendants that are still the same process we saw (a reused pid does not count)."""
+        with self._lock:
+            seen = list(self._child_pids)
+        alive: list[int] = []
+        for pid, born in seen:
+            if psutil is None:
+                if pid_alive(pid):
+                    alive.append(pid)
+                continue
+            try:
+                child = psutil.Process(pid)
+                if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
+                    continue
+                if abs(child.create_time() - born) > 1.5:
+                    continue
+                alive.append(pid)
+            except psutil.Error:
+                continue
+        return alive
+
+    def _job_alive(self) -> bool:
+        """True when the download's job still contains a running process."""
+        with self._lock:
+            job = self._job
+        if not job:
+            return False
+        return any(pid_alive(pid) for pid in _job_pids(job))
+
+    def _end_process(self, proc: subprocess.Popen) -> None:
+        """End the download and every process it spawned. Safe to call twice."""
+        pids = self._children_alive()
+        _close_job(self._take_job())
+        kill_tree(proc)
+        if pids:
+            hff.kill_pids(pids)
+        try:
+            if proc.stdout is not None and not proc.stdout.closed:
+                proc.stdout.close()
+        except (OSError, ValueError):
+            pass
 
     def _on_stall(self, stalled: float) -> None:
-        """Heartbeat watchdog (meter thread): nothing landed for STALL_ALARM_S, so end the
-        download command; run_with_restarts then starts it again."""
+        """Meter thread: nothing new for the long threshold, so end the download.
+
+        A meter that already lost the race with stop_meter (it is no longer
+        self._meter) must not kill the next attempt. The launcher having
+        exited does not make this a no-op: its child may still hold the pipe.
+        """
+        me = threading.current_thread()
         with self._lock:
             proc = self._proc
-        if proc is None or proc.poll() is not None or self.cancelled:
+            current = self._meter
+        if me is not current or proc is None or self.cancelled:
+            return
+        if not restart_due(stalled):
             return
         self._stall_restart = True
         self.line.emit(f"heartbeat: no data for {int(stalled)} s, restarting the download")
-        kill_tree(proc)
+        self._end_process(proc)
 
     def _sleep(self, seconds: float) -> None:
         """Wait between restarts, but wake up at once when cancelled."""
@@ -963,15 +1460,29 @@ class Worker(QThread):
     def run_with_restarts(self, repo_id: str, cmd: list[str], env: dict[str, str], expected: int) -> int:
         """Run a download command until it succeeds.
 
-        A stall (no bytes for STALL_ALARM_S) ends the command and starts it again
-        as often as needed; an exit with an error is retried MAX_FAILED_RESTARTS
-        times. Complete files are skipped by the downloader, stale partial files
-        are dropped first, and the wait between attempts grows from 5 s to 60 s.
+        A stall (nothing new for STALL_ALARM_DISK_S) ends the command and starts
+        it again STALL_RESTART_WAIT_S later, as often as needed. An exit with an
+        error is retried MAX_FAILED_RESTARTS times, but only when the cache did
+        not grow: a transfer that is still landing bytes is not given up on.
+        Before each attempt a stuck holder of the repo's file lock is reclaimed,
+        because huggingface_hub waits on that lock with no deadline. Partials are
+        deleted only once nobody still holds the lock.
         """
         attempt = 0
         failures = 0
         while True:
+            if self.cancelled:
+                raise KeyboardInterrupt
+            if not hff.reclaim_download(repo_id, self.cache_dir, lambda: self.cancelled, self.line.emit):
+                failures += 1
+                if failures > MAX_FAILED_RESTARTS:
+                    self.line.emit(f"{repo_id}: the download lock stayed held, giving up (Resume tries again)")
+                    return 1
+                self.repo_update.emit(repo_id, "restarting", "download lock still held", None)
+                self._sleep(min(5 * 2 ** min(failures - 1, 4), 60))
+                continue
             self._stall_restart = False
+            before = hff.repo_cache_bytes(repo_id, self.cache_dir)
             self.start_meter(repo_id, expected)
             try:
                 rc = self.stream(cmd, env)
@@ -981,18 +1492,32 @@ class Worker(QThread):
                 return 0
             if self.cancelled:
                 raise KeyboardInterrupt
+            grew = hff.repo_cache_bytes(repo_id, self.cache_dir) > before
             if self._stall_restart:
                 why = "stalled"
+                wait = STALL_RESTART_WAIT_S
+                if grew:
+                    failures = 0
+            elif grew:
+                failures = 0
+                why = f"exited with code {rc} after receiving more data"
+                wait = STALL_RESTART_WAIT_S
             else:
                 failures += 1
                 why = f"exited with code {rc}"
                 if failures > MAX_FAILED_RESTARTS:
                     self.line.emit(f"{repo_id}: download {why} {failures} times, giving up (Resume tries again)")
                     return rc
+                wait = min(5 * 2 ** min(failures - 1, 4), 60)
             attempt += 1
             self.restarts += 1
-            wait = min(5 * 2 ** min(attempt - 1, 4), 60)
-            freed = remove_stale_partials(repo_id, self.cache_dir)
+            # A live download still owns these files. Deleting them was how a
+            # false stall threw away a transfer that had only gone quiet.
+            if hff.held_lock_paths(repo_id, self.cache_dir):
+                freed = 0
+                self.line.emit(f"{repo_id}: leaving partial files; a download still holds the lock")
+            else:
+                freed = remove_stale_partials(repo_id, self.cache_dir)
             note = f"{why}; restart {attempt} in {wait} s"
             if freed:
                 note += f", {hff.human(freed)} of partial files dropped"
@@ -1002,10 +1527,14 @@ class Worker(QThread):
             self.repo_update.emit(repo_id, "downloading", f"restart {attempt}", None)
 
     def stop_meter(self) -> None:
-        if self._meter is not None:
-            self._meter.stop()
-            self._meter.join(3)
-            self._meter = None
+        # Detach first. A meter blocked in on_stall must not kill the next attempt,
+        # and join used to give up after 3 s and then clear the pointer anyway.
+        meter = self._meter
+        self._meter = None
+        if meter is None:
+            return
+        meter.stop()
+        meter.join(5)
 
     # -- thread body
 
@@ -1059,13 +1588,52 @@ class Worker(QThread):
 
     # -- helpers for jobs
 
+    def _pump_output(self, proc: subprocess.Popen, splitter: _LineSplitter) -> None:
+        """Read the child's pipe until it closes. Runs off the worker thread.
+
+        A blocking read on the worker was the hang: the launcher exits, a child
+        keeps the pipe, and the worker never returns to the stall check.
+        """
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        stdout = proc.stdout
+        if stdout is None:
+            return
+        # bufsize=0 yields a raw file with no read1, and that killed the reader
+        # on the first chunk. A dead reader used to be treated as "the pipe
+        # closed", and the download was then stopped.
+        read = getattr(stdout, "read1", None) or stdout.read
+        try:
+            while splitter.generation == self._output_gen:
+                chunk = read(65536)
+                if not chunk:
+                    break
+                splitter.write(decoder.decode(chunk))
+            if splitter.generation == self._output_gen:
+                splitter.write(decoder.decode(b"", final=True))
+        except (OSError, ValueError):
+            pass
+        finally:
+            if splitter.generation == self._output_gen:
+                splitter.flush()
+
     def stream(self, cmd: list[str], env: dict[str, str] | None = None) -> int:
-        """Run a command, feeding its output through the log, and return its exit code."""
+        """Run a command, feeding its output through the log, and return its exit code.
+
+        The reader is a separate thread, so this loop can stop the process when
+        the heartbeat asks or the user hits Stop. The process is placed in a
+        Windows job immediately, which is what actually ends the launcher's children.
+        """
         if self.cancelled:
             raise KeyboardInterrupt
         env = dict(env if env is not None else os.environ)
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        env.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+        env.setdefault("HF_HUB_ETAG_TIMEOUT", "20")
+        # huggingface_hub prints its byte counters through a pipe only with this (see hffinish.tool_env)
+        env.setdefault("TQDM_POSITION", "-1")
         flags = subprocess.CREATE_NO_WINDOW if WINDOWS else 0
         proc = subprocess.Popen(
             cmd,
@@ -1075,24 +1643,64 @@ class Worker(QThread):
             stderr=subprocess.STDOUT,
             creationflags=flags,
         )
+        job = _assign_job(proc)
+        self._output_gen += 1
+        splitter = _LineSplitter(self, self._output_gen)
+        reader = threading.Thread(
+            target=self._pump_output, args=(proc, splitter), name="download-output", daemon=True
+        )
         with self._lock:
             self._proc = proc
-        decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        assert proc.stdout is not None
+            self._job = job
+            self._reader = reader
+            self._child_pids = []
+        reader.start()
+        rc: int | None = None
         try:
-            while True:
-                chunk = proc.stdout.read1(4096)
-                if not chunk:
+            while reader.is_alive():
+                self._note_children(proc)
+                if self.cancelled or self._stall_restart:
+                    self._end_process(proc)
                     break
-                sys.stdout.write(decoder.decode(chunk))
-            sys.stdout.write(decoder.decode(b"", final=True))
-            rc = proc.wait()
+                reader.join(0.5)
+            # The reader ending means the pipe closed, not that every child has
+            # exited. A launcher often exits while its child keeps downloading.
+            # Wait those children out. Stop them only when asked (Stop, or the
+            # heartbeat). Killing here on a timer was ending live transfers.
+            stop_deadline: float | None = None
+            while proc.poll() is None or self._children_alive() or self._job_alive():
+                self._note_children(proc)
+                if self.cancelled or self._stall_restart:
+                    if stop_deadline is None:
+                        self._end_process(proc)
+                        stop_deadline = time.monotonic() + 30
+                if stop_deadline is not None and time.monotonic() >= stop_deadline:
+                    self.line.emit("download process did not exit after it was stopped")
+                    break
+                if proc.poll() is None:
+                    try:
+                        proc.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                else:
+                    time.sleep(0.5)
+            reader.join(2)
+            rc = proc.poll()
         finally:
+            _close_job(self._take_job())
+            try:
+                if proc.stdout is not None and not proc.stdout.closed:
+                    proc.stdout.close()
+            except (OSError, ValueError):
+                pass
             with self._lock:
-                self._proc = None
+                if self._proc is proc:
+                    self._proc = None
+                if self._reader is reader:
+                    self._reader = None
         if self.cancelled:
             raise KeyboardInterrupt
-        return rc
+        return 1 if rc is None else rc
 
 
 # --------------------------------------------------------------------------- jobs
@@ -1127,25 +1735,20 @@ def _fetch(w: Worker, repo_id: str, revision: str, opts: Options, expected: int,
     env = hff.tool_env()
     hf = shutil.which("hf", path=env["PATH"]) or shutil.which("hf")
     if hf:
-        cmd = [hf, "download", repo_id]
+        hf_opts = []
         if revision:
-            cmd += ["--revision", revision]
+            hf_opts += ["--revision", revision]
         if opts.cache_dir:
-            cmd += ["--cache-dir", opts.cache_dir]
+            hf_opts += ["--cache-dir", opts.cache_dir]
+        cmd = hff.hf_download_cmd(hf, repo_id, hf_opts)
         w.line.emit("running: " + " ".join(cmd))
         return w.run_with_restarts(repo_id, cmd, env, expected)
-    from huggingface_hub import snapshot_download
-
-    w.line.emit("hf CLI not found on PATH, downloading in-process (cannot be stopped midway)")
-    w.start_meter(repo_id, expected)
-    try:
-        snapshot_download(repo_id, revision=revision or None, cache_dir=opts.cache_dir or None)
-        return 0
-    except Exception as exc:  # noqa: BLE001
-        w.line.emit(f"download failed: {exc}")
-        return 1
-    finally:
-        w.stop_meter()
+    # A child process, not this one. snapshot_download in this thread cannot be
+    # killed when the connection stalls, and Stop did nothing.
+    cmd = hff.snapshot_download_cmd(repo_id, revision or "", opts.cache_dir or "", "model")
+    w.line.emit("hf CLI not found on PATH, downloading in a child process")
+    w.line.emit("running: " + " ".join(cmd))
+    return w.run_with_restarts(repo_id, cmd, env, expected)
 
 
 def download_job(repo_id: str, revision: str, opts: Options, finish_after: bool, resume: bool = False):
@@ -1354,11 +1957,44 @@ def download_in_progress(info, cache: Path) -> str:
     return ""
 
 
+def _blob_totals(repo_path: Path) -> tuple[int, int, float]:
+    """(files, bytes, newest mtime) of one repo's blob directory. No recursive walk."""
+    blobs = repo_path / "blobs"
+    files = size = 0
+    modified = 0.0
+    try:
+        names = os.listdir(blobs)
+    except OSError:
+        return 0, 0, 0.0
+    for fn in names:
+        if fn.endswith(hff.STORE_SIDE_SUFFIXES):
+            continue
+        try:
+            st = os.stat(blobs / fn)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        files += 1
+        size += st.st_size
+        modified = max(modified, st.st_mtime)
+    return files, size, modified
+
+
 def cache_entry(info, rev, dest: Path, cache: Path, layout: str) -> LibraryEntry:
-    """What the cache holds of one repo, checked against the on-disk file list (no network)."""
-    entry = folder_entry(info.repo_id, rev.snapshot_path, "in cache")
-    entry.repo_id = info.repo_id
+    """What the cache holds of one repo, checked against the on-disk file list (no network).
+
+    This used to walk the whole snapshot (and, through symlinks, the blobs) on the
+    GUI thread. A large cache made the window stop painting. The file list is
+    enough: one stat per listed file, and the blob directory is flat.
+    """
     repo = hff.Repo(info, rev)
+    try:
+        modified = rev.snapshot_path.stat().st_mtime
+    except OSError:
+        modified = 0.0
+    entry = LibraryEntry(info.repo_id, rev.snapshot_path, "in cache", modified=modified)
+    entry.repo_id = info.repo_id
     tree_file = info.repo_path / "trees" / f"{rev.commit_hash}.json"
     tree: dict[str, int] | None = None
     try:
@@ -1368,6 +2004,9 @@ def cache_entry(info, rev, dest: Path, cache: Path, layout: str) -> LibraryEntry
     except (OSError, ValueError, KeyError, TypeError):
         tree = None
     if tree is None:
+        files, size, blob_mtime = _blob_totals(info.repo_path)
+        entry.files, entry.size = files, size
+        entry.modified = max(modified, blob_mtime)
         repo.partials = sorted((info.repo_path / "blobs").glob("*.incomplete"))
         entry.state = "unverified"
         entry.note = "no file list on disk; select it and click Verify"
@@ -1380,6 +2019,8 @@ def cache_entry(info, rev, dest: Path, cache: Path, layout: str) -> LibraryEntry
     entry.expected_size = repo.total_bytes
     todo = repo.missing + repo.bad
     if not todo:
+        entry.files = len(tree)
+        entry.size = repo.total_bytes
         entry.state = "in cache"
         entry.note = "complete; Finish and move puts it in the library"
         return entry
@@ -2911,7 +3552,14 @@ STATUS_COLORS = {
     "checking": "#1a73e8",
     "error": "#c5221f",
     "skipped": "#c5221f",
+    "already downloaded": "#1e8e3e",
     "interrupted": "#5f6368",
+}
+
+RATE_TIPS = {
+    "hf": "Bytes per second received from the network, as counted by the downloader itself",
+    "disk": "Bytes per second landing in the hub cache, averaged over the last minutes (the downloader "
+    "writes files in 64 MB steps, so this lags behind the network); the downloader printed no counters",
 }
 
 
@@ -2988,7 +3636,8 @@ class TransferRow(QWidget):
             self.stop_btn.setEnabled(False)
             return None
         self.rate_label.setText(rate(t.speed) if t.speed > 0 else "0 B/s")
-        self.rate_label.setStyleSheet("" if t.stalled < STALL_WARN_S else f"color: {hb_color}")
+        self.rate_label.setToolTip(RATE_TIPS.get(t.source, RATE_TIPS["disk"]))
+        self.rate_label.setStyleSheet("" if t.stalled < t.warn_s else f"color: {hb_color}")
         bits = [who]
         if t.total > 0:
             bits.append(f"{hff.human(t.done)} of {hff.human(t.total)}")
@@ -2998,13 +3647,17 @@ class TransferRow(QWidget):
                 bits.append(f"ETA {eta}")
         else:
             bits.append(f"{hff.human(t.done)} so far (size not known yet)")
+        if t.received > 0:
+            bits.append(f"{hff.human(t.received)} received")
+        if t.files:
+            bits.append(t.files)
         if t.down >= 0:
             bits.append(f"network down {rate(t.down)}, up {rate(t.up)}")
         self.details.setText("   ".join(bits))
-        if t.stalled >= STALL_ALARM_S and not self.stall_logged:
+        if t.stalled >= t.alarm_s and not self.stall_logged:
             self.stall_logged = True
-            return f"heartbeat: no data has landed for {who} in {int(t.stalled)} s"
-        if t.stalled < STALL_WARN_S and self.stall_logged:
+            return f"heartbeat: nothing has arrived for {who} in {int(t.stalled)} s"
+        if t.stalled < t.warn_s and self.stall_logged:
             self.stall_logged = False
             return f"heartbeat: {who} is receiving data again"
         return None
@@ -3127,6 +3780,11 @@ class MainWindow(QMainWindow):
         self._follow_timer.setSingleShot(True)
         self._follow_timer.setInterval(250)  # let a Shift-drag settle before reloading the card
         self._follow_timer.timeout.connect(self._follow_fire)
+        self.list_state_worker: LocalStateWorker | None = None  # cross-references the pasted list with the library
+        self._list_check_timer = QTimer(self)
+        self._list_check_timer.setSingleShot(True)
+        self._list_check_timer.setInterval(700)  # after the last keystroke or paste
+        self._list_check_timer.timeout.connect(self._check_list_local)
         self._build_ui()
         self._build_menu()
         self._load_settings()
@@ -3200,13 +3858,16 @@ class MainWindow(QMainWindow):
         self.list_edit = QPlainTextEdit()
         self.list_edit.setPlaceholderText(
             "Or paste a list: one repo id, link or 'hf download ...' command per line. "
-            "They are downloaded one after the other."
+            "Models already in the library are skipped; the rest download side by side."
         )
         self.list_edit.setMaximumHeight(96)
         self.list_edit.textChanged.connect(self._list_changed)
         list_btns = QVBoxLayout()
         self.download_all_btn = QPushButton("Download all")
-        self.download_all_btn.setToolTip("Download every repo in the list, in order, then verify and move each one")
+        self.download_all_btn.setToolTip(
+            "Download every repo in the list, then verify and move each one. Repos that are already "
+            "in the library or complete in the cache are skipped, never downloaded twice."
+        )
         self.download_all_btn.clicked.connect(self.start_download_list)
         mark(self.download_all_btn, "primary")
         self.clear_list_btn = QPushButton("Clear list")
@@ -3214,11 +3875,15 @@ class MainWindow(QMainWindow):
         self.list_count = QLabel("")
         self.list_count.setEnabled(False)
         self.parallel_spin = QSpinBox()
-        self.parallel_spin.setRange(1, 8)
+        self.parallel_spin.setRange(0, 999)  # 0 = no limit
         self.parallel_spin.setValue(3)
         self.parallel_spin.setPrefix("download ")
         self.parallel_spin.setSuffix(" at once")
-        self.parallel_spin.setToolTip("How many models are downloaded at the same time; the rest wait in the queue")
+        self.parallel_spin.setSpecialValueText("download all at once")
+        self.parallel_spin.setToolTip(
+            "How many models are downloaded at the same time; the rest wait in the queue. "
+            "0 means no limit: every queued model starts right away (they share the connection)."
+        )
         self.parallel_spin.valueChanged.connect(lambda _v: self._pump_queue())
         list_btns.addWidget(self.download_all_btn)
         list_btns.addWidget(self.clear_list_btn)
@@ -3582,15 +4247,20 @@ class MainWindow(QMainWindow):
             self._set_row(repo_id, "queued", "waiting for a download slot", None)
             added += 1
         if added > 1:
-            self.append_line(f"== {added} repos queued, {self.parallel_spin.value()} at once")
+            limit = self.parallel_spin.value()
+            self.append_line(f"== {added} repos queued, " + (f"{limit} at once" if limit else "all at once"))
         self._pump_queue()
         self._set_running(bool(self.workers))
         self._save_unfinished()
         self._update_banner()
 
+    def _parallel_limit(self) -> int:
+        """How many downloads may run at once; the box at 0 means no limit."""
+        return self.parallel_spin.value() or 10**9
+
     def _pump_queue(self) -> None:
         """Start queued downloads while there are free slots."""
-        while self.queue and self._downloads_in_flight() < self.parallel_spin.value() and not self._exclusive_running():
+        while self.queue and self._downloads_in_flight() < self._parallel_limit() and not self._exclusive_running():
             item = self.queue.pop(0)
             opts = self._options()
             finish_after = self.finish_after_cb.isChecked()
@@ -3599,8 +4269,9 @@ class MainWindow(QMainWindow):
                 # pick a cached, unfinished repo up: hffinish's resume pass limited to it (stale
                 # partials dropped, missing files fetched at the cached commit), then the same
                 # three checksum stages and the move as for a fresh download
-                # a partial file written in the last two minutes looks like a live download to
-                # hffinish (it cannot know the process is gone); wait that out and then go on
+                # A partial written in the last two minutes looks like a live download.
+                # --wait rides that out, and a download with no new bytes for 10 minutes
+                # is taken over instead of waited on forever.
                 opts.wait = True
                 opts.poll = 10
                 self._start(
@@ -3691,40 +4362,34 @@ class MainWindow(QMainWindow):
         self.download_many(items)
 
     def download_many(self, items: list[tuple[str, str]]) -> None:
-        """Queue several repos (from the pasted list or a multi-selection in the Hub browser),
-        asking first about the ones that are already downloaded."""
+        """Queue several repos (from the pasted list or a multi-selection in the Hub browser).
+
+        Every repo is cross-referenced with the library and the cache first; one
+        that is already downloaded is skipped (shown as "already downloaded" in
+        the table and logged), so a model is never fetched twice. Repos that are
+        running or queued right now are skipped by _enqueue in the same way.
+        """
         if self._exclusive_running():
             QMessageBox.information(self, APP_NAME, "A pass over the whole cache is running. Wait for it or stop it first.")
             return
         opts = self._options()
         index = LocalIndex(opts.dest_path(), opts.cache_path(), opts.layout)
-        already = [(repo_id, index.lookup(repo_id)) for repo_id, _rev in items]
-        already = [(r, s) for r, s in already if s.downloaded]
-        if already:
-            shown = "\n".join(f"{r}  ({s.state})" for r, s in already[:10])
-            if len(already) > 10:
-                shown += f"\n... and {len(already) - 10} more"
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Icon.Question)
-            box.setWindowTitle(APP_NAME)
-            box.setText(f"{len(already)} of the {len(items)} selected repo(s) have already been downloaded:\n\n{shown}")
-            box.setInformativeText("Are you sure you want to download them again?")
-            again = box.addButton("Download again", QMessageBox.ButtonRole.YesRole)
-            skip = box.addButton("Skip those", QMessageBox.ButtonRole.NoRole)
-            box.addButton(QMessageBox.StandardButton.Cancel)
-            box.setDefaultButton(skip)
-            box.exec()
-            clicked = box.clickedButton()
-            if clicked is skip:
-                done = {r for r, _s in already}
-                items = [it for it in items if it[0] not in done]
-                if not items:
-                    self.statusBar().showMessage("Everything selected is already downloaded.", 6000)
-                    return
-            elif clicked is not again:
-                return
+        states = {repo_id: index.lookup(repo_id) for repo_id, _rev in items}
+        skipped = [(repo_id, states[repo_id]) for repo_id, _rev in items if states[repo_id].downloaded]
+        wanted = [it for it in items if not states[it[0]].downloaded]
         self.show_download_tab()
-        self._enqueue(items)
+        self._enqueue(wanted)
+        for repo_id, local in skipped:
+            self._set_row(repo_id, "already downloaded", f"skipped: {local.note}", None)
+        if skipped:
+            names = ", ".join(r for r, _s in skipped[:6])
+            if len(skipped) > 6:
+                names += f" and {len(skipped) - 6} more"
+            self.append_line(f"skipped {len(skipped)} of {len(items)}, already downloaded: {names}")
+            if wanted:
+                self.statusBar().showMessage(f"{len(wanted)} queued, {len(skipped)} already downloaded and skipped", 8000)
+            else:
+                self.statusBar().showMessage("Everything in the list is already downloaded; nothing to fetch.", 8000)
 
     def add_to_list(self, repo_id: str) -> None:
         """Append a repo to the list on the Download tab (from the Hub browser or the card window)."""
@@ -3742,6 +4407,40 @@ class MainWindow(QMainWindow):
         if items or rejected:
             text = f"{len(items)} repo(s)" + (f", {len(rejected)} bad line(s)" if rejected else "")
         self.list_count.setText(text)
+        self.list_count.setToolTip("")
+        self._list_check_timer.start()  # then cross-reference the list with the library, off the GUI thread
+
+    @Slot()
+    def _check_list_local(self) -> None:
+        """Look every repo in the pasted list up on disk and say how many would be skipped."""
+        items, _rejected = parse_repo_list(self.list_edit.toPlainText())
+        if not items:
+            return
+        if self.list_state_worker is not None:
+            self._list_check_timer.start()  # a check is running; look again when it is done
+            return
+        w = LocalStateWorker([repo_id for repo_id, _rev in items], self._options(), self)
+        w.states.connect(self._list_local_states)
+        w.finished.connect(lambda w=w: self._list_check_done(w))
+        self.list_state_worker = w
+        w.start()
+
+    def _list_check_done(self, w: LocalStateWorker) -> None:
+        if self.list_state_worker is w:
+            self.list_state_worker = None
+        w.deleteLater()
+
+    @Slot(dict)
+    def _list_local_states(self, states: dict) -> None:
+        items, rejected = parse_repo_list(self.list_edit.toPlainText())
+        have = [repo_id for repo_id, _rev in items if repo_id in states and states[repo_id].downloaded]
+        text = f"{len(items)} repo(s)"
+        if have:
+            text += f", {len(have)} already downloaded (skipped)"
+        if rejected:
+            text += f", {len(rejected)} bad line(s)"
+        self.list_count.setText(text)
+        self.list_count.setToolTip("\n".join(f"{repo_id}: {states[repo_id].note}" for repo_id in have))
 
     def show_details(self, repo_id: str) -> None:
         if self.card_dialog is None:
@@ -3762,14 +4461,18 @@ class MainWindow(QMainWindow):
         if dlg is not None and dlg.isVisible() and self._follow_repo and dlg.repo_id != self._follow_repo:
             dlg.load(self._follow_repo, raise_window=False)
 
-    def start_finish(self, dry_run: bool, title: str = "") -> None:
-        """A pass over the whole cache: runs alone."""
+    def start_finish(self, dry_run: bool, title: str = "", exclusive: bool = True) -> None:
+        """A pass over the whole cache.
+
+        Finish and move runs alone. The check that runs when the window opens
+        does not: it used to, and a slow cache walk blocked every download.
+        """
         opts = self._options(dry_run=dry_run)
         self._start(
             finish_job(opts),
             (title + ": " if title else "") + "hffinish " + " ".join(opts.argv()),
-            kind="exclusive",
-            clear=True,
+            kind="exclusive" if exclusive else "download",
+            clear=exclusive,
         )
 
     def start_verify(self, repo_ids: str | list[str]) -> None:
@@ -4034,8 +4737,14 @@ class MainWindow(QMainWindow):
     def _on_done(self, w: Worker, rc: int) -> None:
         if w in self.workers:
             self.workers.remove(w)
-        w.wait(2000)
-        w.deleteLater()
+        # The thread emits `done` just before run() returns. Waiting for it here
+        # froze the window for up to two seconds after every job. `finished` is
+        # still queued behind this slot, so connecting here deletes the thread
+        # once; if it has already finished, delete it directly.
+        if w.isFinished():
+            w.deleteLater()
+        else:
+            w.finished.connect(w.deleteLater)
         text = {0: "finished", 1: "finished with problems, see the log", 2: "could not start, see the log", 130: "stopped"}
         what = f" ({', '.join(w.repo_ids)})" if w.repo_ids else ""
         self.statusBar().showMessage(text.get(rc, f"finished with exit code {rc}") + what, 15000)
@@ -4062,6 +4771,7 @@ class MainWindow(QMainWindow):
         if not self.workers:
             self.library.refresh()
             self.browse.refresh_local()
+            self._list_check_timer.start()  # the list's "already downloaded" count changed too
 
     def _report_verification(self, repo_id: str) -> None:
         row = self.rows.get(repo_id)
@@ -4236,6 +4946,8 @@ class MainWindow(QMainWindow):
             self.browse.worker.wait(5000)
         if self.browse.local_worker is not None:
             self.browse.local_worker.wait(5000)
+        if self.list_state_worker is not None:
+            self.list_state_worker.wait(5000)
         self.stop_external()
         if self.card_dialog is not None:
             self.card_dialog.close()
@@ -4254,22 +4966,33 @@ class MainWindow(QMainWindow):
 
 # Colours on top of the platform style. Base colours come from the palette
 # (palette(...) in the sheet) so the window follows the system's light or
-# dark mode; only the accents are fixed.
+# dark mode; only the accents are fixed: the Hugging Face orange on tabs,
+# headers and progress bars, green on every button (the main download
+# buttons solid green, the others outlined), red on the Stop buttons.
+GREEN = "#1e8e3e"
+GREEN_HOVER = "#2ea44f"
+GREEN_PRESSED = "#176d30"
+GREEN_EDGE = "#146c2e"
 THEME = f"""
 QTabBar::tab {{ padding: 7px 18px; border-bottom: 3px solid transparent; }}
 QTabBar::tab:selected {{ border-bottom: 3px solid {ACCENT}; font-weight: bold; }}
-QTabBar::tab:hover:!selected {{ border-bottom: 3px solid {ACCENT}80; }}
+QTabBar::tab:hover:!selected {{ border-bottom: 3px solid rgba(255, 157, 0, 50%); }}
 QGroupBox {{ border: 1px solid palette(mid); border-radius: 6px; margin-top: 12px; padding-top: 6px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {ACCENT}; font-weight: bold; }}
 QProgressBar {{ border: 1px solid palette(mid); border-radius: 4px; text-align: center; height: 20px; }}
 QProgressBar::chunk {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffb347, stop:1 {ACCENT}); border-radius: 3px; }}
-QPushButton[primary="true"] {{ background: {ACCENT}; color: {contrast_text(QColor(ACCENT)).name()}; font-weight: bold; border: 1px solid #c97a00; border-radius: 4px; padding: 5px 14px; }}
-QPushButton[primary="true"]:hover {{ background: #ffb347; }}
-QPushButton[primary="true"]:pressed {{ background: #e68d00; }}
+QPushButton {{ border: 1px solid {GREEN}; border-radius: 4px; padding: 5px 12px; background: palette(button); color: palette(button-text); }}
+QPushButton:hover {{ background: rgba(30, 142, 62, 18%); }}
+QPushButton:pressed {{ background: rgba(30, 142, 62, 40%); }}
+QPushButton:disabled {{ border-color: palette(mid); color: palette(mid); }}
+QPushButton[primary="true"] {{ background: {GREEN}; color: white; font-weight: bold; border: 1px solid {GREEN_EDGE}; padding: 5px 14px; }}
+QPushButton[primary="true"]:hover {{ background: {GREEN_HOVER}; }}
+QPushButton[primary="true"]:pressed {{ background: {GREEN_PRESSED}; }}
 QPushButton[primary="true"]:disabled {{ background: palette(mid); color: palette(dark); border-color: palette(mid); }}
-QPushButton[danger="true"]:enabled {{ color: #c5221f; font-weight: bold; }}
+QPushButton[danger="true"]:enabled {{ color: #c5221f; border-color: #c5221f; font-weight: bold; }}
+QPushButton[danger="true"]:enabled:hover {{ background: rgba(197, 34, 31, 15%); }}
 QHeaderView::section {{ padding: 4px 6px; border: none; border-bottom: 2px solid {ACCENT}; border-right: 1px solid palette(mid); background: palette(button); }}
-QTableWidget {{ gridline-color: palette(midlight); selection-background-color: {ACCENT}55; selection-color: palette(text); }}
+QTableWidget {{ gridline-color: palette(midlight); selection-background-color: rgba(255, 157, 0, 33%); selection-color: palette(text); }}
 QStatusBar {{ border-top: 2px solid {ACCENT}; }}
 """
 
@@ -4282,6 +5005,10 @@ def mark(button: QPushButton, role: str) -> None:
 
 
 def main(argv: list[str]) -> int:
+    # A frozen build has no separate Python. The download fallback starts this
+    # same executable again; it must download and exit, not open another window.
+    if len(argv) > 1 and argv[1] == "--snapshot-download":
+        return hff.snapshot_download_cli(argv[2:])
     if WINDOWS:  # own taskbar icon and grouping, also when started through python.exe
         try:
             import ctypes
@@ -4306,8 +5033,9 @@ def main(argv: list[str]) -> int:
         QTimer.singleShot(1500, app.quit)
     else:
         # verify what is in the cache right away: a download that stopped (crash,
-        # closed window, lost network) shows up as "incomplete" before anything else
-        QTimer.singleShot(300, lambda: win.start_finish(dry_run=True, title="startup check"))
+        # closed window, lost network) shows up as "incomplete" before anything else.
+        # Not exclusive: the check only reads, and it must not block a new download.
+        QTimer.singleShot(300, lambda: win.start_finish(dry_run=True, title="startup check", exclusive=False))
     return app.exec()
 
 

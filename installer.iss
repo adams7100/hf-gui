@@ -11,7 +11,7 @@
 ;   ISCC.exe installer.iss          -> dist\HF-Downloader-setup-<version>.exe
 
 #ifndef AppVersion
-  #define AppVersion "1.2.0"
+  #define AppVersion "1.3.0"
 #endif
 #define AppName "HF-Downloader"
 #define AppExe "HF-Downloader.exe"

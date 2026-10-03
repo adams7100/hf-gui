@@ -45,8 +45,11 @@ import os
 import re
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,15 +70,65 @@ except ImportError:  # POSIX
 # because it reads the variables once at import time.
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("DISABLE_TELEMETRY", "1")
+# huggingface_hub reads these once, at import. The library default for a file
+# download is 10s with no bytes, which aborts a slow transfer; metadata calls
+# pass timeout=None, and the shared client then waits forever.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "20")
 
 from huggingface_hub import HfApi, constants
 from huggingface_hub.hf_api import RepoFile
 
 DEFAULT_DEST = Path.home() / "models"
 ACTIVE_WINDOW_S = 120  # a partial file written this recently counts as "download in progress"
+# A download that receives nothing for this long is stuck (a file lock, a dead
+# connection). Waiting longer than this, or blocking on its lock, is what made
+# a transfer sit forever. Xet can be quiet for a minute or two between 64 MB
+# writes, so this is well past that.
+STUCK_DOWNLOAD_S = 600
 STAGING_PREFIX = ".hffinish-partial."
 STORE_SIDE_SUFFIXES = (".refs", ".lock")  # companions of a shared-store blob
 WINDOWS = os.name == "nt"
+HUB_TIMEOUT_S = 120.0  # connect / read / write cap for Hub HTTP calls that pass no timeout
+
+
+def install_hub_timeouts() -> None:
+    """Give Hub HTTP calls a deadline.
+
+    `list_repo_tree` and `model_info` pass `timeout=None`. In httpx that means
+    no timeout at all, even when the client has one, so a stalled connection
+    while asking for the file list never returns and the download never starts.
+    """
+    import httpx2
+    from huggingface_hub.utils import _http
+
+    timeout = httpx2.Timeout(connect=20.0, read=HUB_TIMEOUT_S, write=HUB_TIMEOUT_S, pool=20.0)
+
+    def factory():
+        client = _http.default_client_factory()
+        client.timeout = timeout
+        request = client.request
+        stream = client.stream
+
+        def _with_timeout(kwargs: dict) -> dict:
+            if kwargs.get("timeout") is None:
+                kwargs["timeout"] = timeout
+            return kwargs
+
+        def wrapped_request(*args, **kwargs):
+            return request(*args, **_with_timeout(kwargs))
+
+        def wrapped_stream(*args, **kwargs):
+            return stream(*args, **_with_timeout(kwargs))
+
+        client.request = wrapped_request  # type: ignore[method-assign]
+        client.stream = wrapped_stream  # type: ignore[method-assign]
+        return client
+
+    _http.set_client_factory(factory)
+
+
+install_hub_timeouts()
 
 
 # --------------------------------------------------------------------------- helpers
@@ -94,6 +147,12 @@ def log(repo: "Repo | None", msg: str) -> None:
     stamp = time.strftime("%H:%M:%S")
     prefix = f"{stamp} [{repo.repo_id}] " if repo else f"{stamp} "
     print(prefix + msg, flush=True)
+
+
+def sleep_poll(seconds: float) -> None:
+    """Wait `seconds`. The window replaces this so Stop wakes the wait at once."""
+    if seconds > 0:
+        time.sleep(seconds)
 
 
 def link_chain(path: Path) -> list[Path]:
@@ -120,7 +179,53 @@ def tool_env() -> dict[str, str]:
         for p in env.get("PATH", "").split(os.pathsep)
         if p and os.path.normcase(os.path.normpath(p)) not in own
     )
+    if not _stderr_is_tty():
+        # huggingface_hub hides its byte counters when the output is not a terminal
+        # (the window reads them through a pipe); TQDM_POSITION=-1 is its switch to
+        # print them anyway, see huggingface_hub/utils/tqdm.py
+        env.setdefault("TQDM_POSITION", "-1")
     return env
+
+
+def _stderr_is_tty() -> bool:
+    try:
+        return bool(sys.stderr and sys.stderr.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+_HF_FORMAT_FLAG: dict[str, list[str]] = {}
+
+
+def hf_download_args(hf: str) -> list[str]:
+    """Extra options for `hf download` that make it report progress through a pipe.
+
+    huggingface_hub 2.x switches to a terse "agent" output when stdout is not a
+    terminal and prints no byte counts at all; `--format human` brings them back.
+    Older CLIs have no such option, so it is probed once per hf path.
+    """
+    if hf not in _HF_FORMAT_FLAG:
+        args: list[str] = []
+        try:
+            out = subprocess.run(
+                [hf, "download", "--help"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if "--format" in (out.stdout or "") + (out.stderr or ""):
+                args = ["--format", "human"]
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _HF_FORMAT_FLAG[hf] = args
+    return list(_HF_FORMAT_FLAG[hf])
+
+
+def hf_download_cmd(hf: str, repo_id: str, opts: list[str] | None = None) -> list[str]:
+    """The `hf download` command line for a repo, with the progress options the window relies on."""
+    return [hf, "download", repo_id, *(opts or []), *hf_download_args(hf)]
 
 
 def in_shared_store(real: Path, cache_dir: Path) -> bool:
@@ -306,7 +411,14 @@ def checksum(repo: Repo, api: HfApi, cache_dir: Path) -> None:
             repo.missing.append(p)
 
 
-def process_cmdlines() -> list[tuple[int, list[str]]]:
+# One process listing is shared for a moment. Calling PowerShell once per repo
+# (the old behaviour) made a cache check look hung: each call waits on WMI.
+_CMDLINE_CACHE: tuple[float, list[tuple[int, list[str]]]] | None = None
+_CMDLINE_LOCK = threading.Lock()
+_CMDLINE_MAX_AGE_S = 2.0
+
+
+def _read_cmdlines() -> list[tuple[int, list[str]]]:
     """(pid, argv) for every process whose command line can be read."""
     out: list[tuple[int, list[str]]] = []
     if WINDOWS:
@@ -317,7 +429,7 @@ def process_cmdlines() -> list[tuple[int, list[str]]]:
                 stdin=subprocess.DEVNULL,  # a windowed host (HF-Downloader) has no console stdin
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=15,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             ).stdout
             rows = json.loads(raw) if raw.strip() else []
@@ -344,23 +456,226 @@ def process_cmdlines() -> list[tuple[int, list[str]]]:
     return out
 
 
+def process_cmdlines() -> list[tuple[int, list[str]]]:
+    """(pid, argv) for every process whose command line can be read.
+
+    The listing is reused for a couple of seconds so a pass over many repos
+    does not start a PowerShell process per repo.
+    """
+    global _CMDLINE_CACHE
+    now = time.monotonic()
+    with _CMDLINE_LOCK:
+        if _CMDLINE_CACHE is not None and now - _CMDLINE_CACHE[0] < _CMDLINE_MAX_AGE_S:
+            return list(_CMDLINE_CACHE[1])
+    rows = _read_cmdlines()
+    with _CMDLINE_LOCK:
+        _CMDLINE_CACHE = (time.monotonic(), rows)
+    return list(rows)
+
+
 def lock_is_held(lock: Path) -> bool:
-    """True when another process holds huggingface_hub's per-file download lock."""
+    """True when another process holds huggingface_hub's per-file download lock.
+
+    The lock is taken only for the probe and always released. On Windows a
+    sharing violation while opening the file means someone already has it;
+    treating that as "not held" made the next download wait on the lock forever.
+    """
     try:
         fd = os.open(lock, os.O_RDWR)
+    except PermissionError:
+        return True
     except OSError:
         return False
+    held = False
     try:
         if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, PermissionError):
+                held = True
+            else:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
         else:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-    except (BlockingIOError, PermissionError):
-        return True
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                # held: PermissionError (errno 13) or deadlock (errno 36)
+                held = True
+            else:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
     finally:
         os.close(fd)
+    return held
+
+
+def repo_dir_name(repo_id: str) -> str:
+    return f"models--{repo_id.replace('/', '--')}"
+
+
+def repo_cache_bytes(repo_id: str, cache_dir: Path) -> int:
+    """Bytes of one repo currently in the cache, partial files included."""
+    blobs = cache_dir / repo_dir_name(repo_id) / "blobs"
+    total = 0
+    try:
+        names = os.listdir(blobs)
+    except OSError:
+        return 0
+    for fn in names:
+        if fn.endswith(STORE_SIDE_SUFFIXES):
+            continue
+        try:
+            st = os.stat(blobs / fn)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            total += st.st_size
+    return total
+
+
+def argv_is_checker(argv: list[str]) -> bool:
+    """True when this command is a check or wait pass, not a download.
+
+    A ``--snapshot-download`` child is a real download and is not skipped.
+    Skipping every command that mentions this tool made that child invisible,
+    so a stuck one was waited on forever.
+    """
+    low = [a.lower() for a in argv]
+    if "--snapshot-download" in low:
+        return False
+    for arg in low:
+        base = os.path.basename(arg)
+        if "hffinish" in base or "hf_downloader" in base or "hf-downloader" in base:
+            return True
     return False
+
+
+def repo_download_pids(repo_id: str) -> list[int]:
+    """Pids of other processes whose command line names this repo.
+
+    Our own process and a hffinish pass are not included: they are the ones
+    doing the check, not a download to wait for.
+    """
+    mine = {os.getpid(), os.getppid()}
+    want = repo_id.lower()
+    pids: list[int] = []
+    for pid, argv in process_cmdlines():
+        if pid in mine or pid <= 0:
+            continue
+        if argv_is_checker(argv):
+            continue
+        if any(a.lower() == want for a in argv):
+            pids.append(pid)
+    return pids
+
+
+def held_lock_paths(repo_id: str, cache_dir: Path) -> list[Path]:
+    root = cache_dir / ".locks" / repo_dir_name(repo_id)
+    if not root.is_dir():
+        return []
+    return [p for p in root.glob("*.lock") if lock_is_held(p)]
+
+
+def drop_free_locks(repo_id: str, cache_dir: Path) -> int:
+    """Remove lock files nobody holds. A leftover soft lock blocks the next download forever."""
+    root = cache_dir / ".locks" / repo_dir_name(repo_id)
+    if not root.is_dir():
+        return 0
+    dropped = 0
+    for path in root.glob("*.lock"):
+        if lock_is_held(path):
+            continue
+        try:
+            path.unlink()
+            dropped += 1
+        except OSError:
+            pass
+    return dropped
+
+
+def kill_pids(pids: list[int]) -> None:
+    """End these processes and the children they spawned."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for pid in pids:
+        if pid <= 0 or pid == os.getpid():
+            continue
+        if WINDOWS:
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(pid)],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=15,
+                    creationflags=flags,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    # The listing is cached for a moment. A pid we just ended must not still
+    # count as a live download on the next check.
+    global _CMDLINE_CACHE
+    with _CMDLINE_LOCK:
+        _CMDLINE_CACHE = None
+
+
+def reclaim_download(repo_id: str, cache_dir: Path, should_stop, log_fn) -> bool:
+    """Wait until this repo's download lock is free.
+
+    A download that is still receiving data is left to finish. One that sits
+    silent for STUCK_DOWNLOAD_S is stopped, so the next attempt cannot block
+    forever inside huggingface_hub's file lock (that lock waits without a
+    deadline). Returns False when the lock is still held and the caller should
+    not start another download yet.
+
+    `should_stop` is a zero-argument callable; True raises KeyboardInterrupt.
+    `log_fn` receives one line of text.
+    """
+    last = repo_cache_bytes(repo_id, cache_dir)
+    changed = time.monotonic()
+    announced = False
+    while True:
+        if should_stop():
+            raise KeyboardInterrupt
+        pids = repo_download_pids(repo_id)
+        locks = held_lock_paths(repo_id, cache_dir)
+        if not pids and not locks:
+            drop_free_locks(repo_id, cache_dir)
+            return True
+        now = time.monotonic()
+        cur = repo_cache_bytes(repo_id, cache_dir)
+        if cur != last:
+            last = cur
+            changed = now
+        if not announced:
+            log_fn(
+                f"{repo_id}: another download still has the cache "
+                f"({len(pids)} process(es), {len(locks)} lock(s)); waiting for it to finish or go quiet"
+            )
+            announced = True
+        if now - changed < STUCK_DOWNLOAD_S:
+            sleep_poll(1)
+            continue
+        if pids:
+            log_fn(
+                f"{repo_id}: no new data for {int(now - changed)}s, "
+                f"stopping stuck process(es) {', '.join(str(p) for p in pids)}"
+            )
+            kill_pids(pids)
+            sleep_poll(1)
+        drop_free_locks(repo_id, cache_dir)
+        if not repo_download_pids(repo_id) and not held_lock_paths(repo_id, cache_dir):
+            return True
+        log_fn(f"{repo_id}: the download lock is still held")
+        return False
 
 
 def active_reason(repo: Repo, cache_dir: Path) -> str | None:
@@ -371,7 +686,7 @@ def active_reason(repo: Repo, cache_dir: Path) -> str | None:
     for pid, argv in process_cmdlines():
         if pid in mine:
             continue
-        if any("hffinish" in a.lower() for a in argv):
+        if argv_is_checker(argv):
             continue
         if any(a.lower() == want for a in argv):
             shown = " ".join(os.path.basename(a) if os.path.isabs(a) else a for a in argv)
@@ -444,21 +759,57 @@ def resume(repo: Repo, args: argparse.Namespace, cache_dir: Path) -> int:
     if hfq:
         cmd = [hfq, repo.repo_id, "--", *hf_opts]
     elif hf:
-        cmd = [hf, "download", repo.repo_id, *hf_opts]
+        cmd = hf_download_cmd(hf, repo.repo_id, hf_opts)
     else:
-        log(repo, "neither hfq nor hf on PATH, downloading in-process")
-        from huggingface_hub import snapshot_download
-
-        try:
-            snapshot_download(
-                repo.repo_id, revision=repo.commit, repo_type=repo.info.repo_type, cache_dir=str(cache_dir)
-            )
-            return 0
-        except Exception as exc:  # noqa: BLE001 - report and carry on with the next repo
-            log(repo, f"download failed: {exc}")
-            return 1
+        # A child process, not this one. An in-process snapshot_download cannot
+        # be killed when the connection stalls, so the download never finishes
+        # and Stop does nothing.
+        cmd = snapshot_download_cmd(repo.repo_id, repo.commit, str(cache_dir), repo.info.repo_type)
+        log(repo, "neither hfq nor hf on PATH, downloading in a child process")
     log(repo, "running: " + " ".join(cmd))
     return run_download(repo, cmd, env)
+
+
+def snapshot_download_cmd(repo_id: str, revision: str, cache_dir: str, repo_type: str = "model") -> list[str]:
+    """Command line that re-executes this program to download one repo.
+
+    A frozen build has no `python -c`; the same executable is started again
+    with `--snapshot-download` and does not open the window.
+    """
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--snapshot-download", repo_id]
+    else:
+        cmd = [sys.executable, str(Path(sys.argv[0]).resolve()), "--snapshot-download", repo_id]
+    if revision:
+        cmd += ["--revision", revision]
+    if cache_dir:
+        cmd += ["--cache-dir", cache_dir]
+    if repo_type and repo_type != "model":
+        cmd += ["--repo-type", repo_type]
+    return cmd
+
+
+def snapshot_download_cli(argv: list[str]) -> int:
+    """Download one repo and exit. Used by the child process started above."""
+    ap = argparse.ArgumentParser(prog="snapshot-download")
+    ap.add_argument("repo_id")
+    ap.add_argument("--revision", default=None)
+    ap.add_argument("--cache-dir", default=None)
+    ap.add_argument("--repo-type", default="model")
+    args = ap.parse_args(argv)
+    from huggingface_hub import snapshot_download
+
+    try:
+        snapshot_download(
+            args.repo_id,
+            revision=args.revision or None,
+            cache_dir=args.cache_dir or None,
+            repo_type=args.repo_type or "model",
+        )
+    except Exception as exc:  # noqa: BLE001 - the parent logs the exit code
+        print(f"download failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def run_download(repo: Repo, cmd: list[str], env: dict[str, str]) -> int:
@@ -653,6 +1004,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "--snapshot-download":
+        return snapshot_download_cli(argv[1:])
     args = parse_args(argv)
     cache_dir = Path(args.cache_dir or constants.HF_HUB_CACHE).expanduser().resolve()
     if not cache_dir.is_dir():
@@ -682,26 +1035,55 @@ def main(argv: list[str]) -> int:
     api = HfApi()
     refcount = build_refcounts(cached)
     announced: set[str] = set()
+    # repo id -> (monotonic time bytes last grew, byte count then)
+    quiet_since: dict[str, tuple[float, int]] = {}
     todo = repos
     try:
         while todo:
             deferred: list[Repo] = []
+            now = time.monotonic()
             for repo in todo:
                 reason = active_reason(repo, cache_dir)
                 if reason:
-                    if args.wait:
+                    nbytes = repo_cache_bytes(repo.repo_id, cache_dir)
+                    since, prev = quiet_since.get(repo.repo_id, (now, nbytes))
+                    if nbytes != prev:
+                        since = now
+                    quiet_since[repo.repo_id] = (since, nbytes)
+                    stuck = now - since >= STUCK_DOWNLOAD_S
+                    if not args.wait:
+                        repo.status, repo.note = "downloading", reason
+                        log(repo, f"being downloaded by another process ({reason}), left alone")
+                        continue
+                    if not stuck:
                         if repo.repo_id not in announced:
                             log(repo, f"being downloaded by another process ({reason}), waiting")
                             announced.add(repo.repo_id)
                         deferred.append(repo)
-                    else:
-                        repo.status, repo.note = "downloading", reason
-                        log(repo, f"being downloaded by another process ({reason}), left alone")
-                    continue
+                        continue
+                    # --wait used to loop for as long as the other process existed,
+                    # and that process may itself be blocked forever on a file lock.
+                    # Take it over only after a long stretch with no new bytes, so a
+                    # download that is still growing is never killed.
+                    log(
+                        repo,
+                        f"no new data for {int(now - since)}s ({reason}); stopping that download and continuing",
+                    )
+                    kill_pids(repo_download_pids(repo.repo_id))
+                    sleep_poll(1)
+                    drop_free_locks(repo.repo_id, cache_dir)
+                    if held_lock_paths(repo.repo_id, cache_dir):
+                        log(repo, "the download lock is still held; will try again")
+                        quiet_since[repo.repo_id] = (now, nbytes)
+                        deferred.append(repo)
+                        continue
+                    quiet_since.pop(repo.repo_id, None)
+                else:
+                    quiet_since.pop(repo.repo_id, None)
                 process(repo, args, api, refcount, cache_dir)
             if not deferred:
                 break
-            time.sleep(args.poll)
+            sleep_poll(args.poll)
             todo = deferred
     except KeyboardInterrupt:
         print("\nhffinish: interrupted", file=sys.stderr)

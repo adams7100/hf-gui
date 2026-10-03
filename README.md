@@ -51,7 +51,8 @@ API, an HTTP write method or another `hf` subcommand appears.
 - [`uv`](https://docs.astral.sh/uv/): the script declares its own dependency
   (`huggingface_hub>=1.32`) and `uv run` installs it on first use. Without uv,
   run it with any Python 3.11+ that has that package.
-- The `hf` CLI for downloads. Without it the script downloads in-process.
+- The `hf` CLI for downloads. Without it the script downloads in a child
+  process (so a stalled transfer can still be stopped).
 
 On Windows none of this needs setting up by hand: see [Windows](#windows).
 
@@ -99,7 +100,9 @@ something is incomplete, skipped, or failed, 130 when interrupted.
   the re-download so the downloader does not trust it.
 - **In progress**: a process has the repo id on its command line, one of the
   repo's `.locks/*.lock` files is held, or a `*.incomplete` file was written in
-  the last two minutes.
+  the last two minutes. With `--wait`, a download that adds no bytes for 10
+  minutes is stopped and the pass continues; one that is still growing is left
+  to finish. Without `--wait` an in-progress repo is left alone.
 - **Resume**: huggingface_hub 1.32 never resumes a half-written file. Each
   attempt writes a fresh `<etag>.<uuid>.incomplete` and abandons the old one,
   so resuming means skipping finished files and restarting the rest. Stale
@@ -144,10 +147,19 @@ three tabs.
   finish pass follows and the model ends up in `~/models/<name>` as plain
   files.
 - **Download a list**: paste any number of repos, one per line in any of the
-  forms above (blank lines and `#` comments are skipped, duplicates dropped),
-  and click "Download all". Lines that are not repos are shown before the run
-  starts and skipped. The list is kept between starts, and the Hub browser's
-  "Add to list" appends to it.
+  forms above (blank lines and `#` comments are skipped, a repo listed twice
+  in any form or letter case is kept once), and click "Download all". Lines
+  that are not repos are shown before the run starts and skipped. **Nothing is
+  ever downloaded twice**: the list is cross-referenced with the library and
+  the hub cache, and every repo that is already in the library or complete in
+  the cache is skipped automatically, shown as "already downloaded" in the
+  table and named in the log. The count under the list says in advance how
+  many will be skipped ("12 repo(s), 3 already downloaded (skipped)"; hover it
+  for the names and where they are) and is refreshed as you edit the list and
+  after every download. The same check applies to a multi-selection in the Hub
+  browser. The list is kept between starts, and the Hub browser's "Add to
+  list" appends to it. Only the single Download button, with one repo in the
+  field, still asks before fetching a model that is already on disk.
 - **Unfinished downloads survive a restart**: every running or queued download
   is remembered (in the app's settings), as is any that stopped or failed.
   When the window opens again a banner on the Download tab lists them with a
@@ -162,32 +174,48 @@ three tabs.
   re-checked. A folder that does not exist yet is created when the first
   model is moved into it.
 - **Several at once**: downloads run side by side, as many as the "download N
-  at once" box allows (default 3); the rest wait in a queue and start as slots
-  free up. Each running download has its own row in the progress panel with
+  at once" box allows (default 3, any number up to 999, or 0 for "download all
+  at once" with no limit); the rest wait in a queue and start as slots free
+  up. Each running download has its own row in the progress panel with
   its own Stop button, and the table marks queued repos as "queued". Each one
   is verified and moved on its own when "then move it to the library" is on.
   More downloads can be added while others run; only "Check (dry run)" and
   "Finish and move", which walk the whole cache, wait until nothing else runs.
 - **Progress**: while a download runs, a progress bar shows bytes in the cache
-  against the size the Hub reports for the repo, with the download rate into
-  the cache as bytes and bits per second (`85.3 MB/s (682 Mbit/s)`), an ETA,
-  and the machine's network throughput in both directions (download and
-  upload, from `psutil`). The meter watches the repo's blobs folder once a
-  second, so it is exact whatever downloader is at work, including a resume
-  started by the finish pass.
+  against the size the Hub reports for the repo, with the download rate as
+  bytes and bits per second (`85.3 MB/s (682 Mbit/s)`), an ETA, how many
+  bytes have been received and how many of the repo's files are done, and the
+  machine's network throughput in both directions (download and upload, from
+  `psutil`). The rate is the one the downloader itself counts: `hf download`
+  is started with `--format human` (and `TQDM_POSITION=-1`, huggingface_hub's
+  switch to print its counters through a pipe) and its "Downloading bytes"
+  line, bytes received from the network, is parsed every time it is redrawn.
+  Watching the files in the cache grow is not enough with the xet downloader,
+  which writes each file in 64 MB steps with a minute or two of nothing in
+  between at ordinary speeds; that is what made the rate flicker to 0 B/s and
+  back. When the downloader prints no counters (an `hf` without `--format`,
+  or the child-process fallback) the meter falls back to the bytes landing
+  in the cache, averaged over the last five minutes so the 64 MB steps read
+  as a steady figure, and says so in the rate's tooltip.
 - **Heartbeat**: the meter is also a watchdog. Every second it checks that
-  the byte count on disk is still moving and that the downloading process is
-  still alive, and says so next to the rate: "receiving data" (green), "no
-  data for N s" (amber after 20 s), "stalled" (red after 90 s, also logged)
-  or "process gone". The rate itself is shown large, as bytes and bits per
-  second, and drops to 0 B/s as soon as nothing has landed for 3 s instead of
-  fading slowly.
-- **Downloads never stay stalled**: the heartbeat is also a watchdog for the
-  app's own downloads. When no byte has landed for 90 s it ends the download
-  command and starts it again (complete files are skipped by the downloader,
-  stale partial files are dropped first), as often as needed; a download that
-  exits with an error is retried up to 5 times. The wait between attempts
-  grows from 5 s to 60 s, the table shows "restarting", and every restart is
+  bytes are still arriving (the downloader's received count, bytes it has
+  reconstructed, or failing that the byte count on disk) and that the
+  download is still producing output, and says so next to the rate:
+  "receiving data" (green), "no data for N s" (amber after 20 s, or after 3
+  minutes when only the cache can be watched), "stalled" (red after 10
+  minutes, also logged) or "process gone". The rate reads 0 B/s once nothing
+  new has been received, reconstructed or written for 5 s.
+- **Downloads never stay stalled**: when nothing new has arrived for 10
+  minutes the download command and the children it spawned are stopped and
+  started again one second later. Ten minutes is past the minute or two xet
+  stays quiet between 64 MB writes; a shorter cutoff was killing live
+  transfers and deleting their partial files. Complete files are skipped by
+  the downloader. Partial files are dropped only when no download still holds
+  the repo's lock. A download that exits with an error without adding any
+  bytes is retried up to 5 times with a wait that grows from 5 s to 60 s; one
+  that is still landing bytes is not counted toward that limit. A file lock
+  left behind by a stuck download is cleared before the next attempt (that
+  lock waits forever). The table shows "restarting", and every restart is
   logged. Stop still ends everything at once.
 - **Three checksums per download**: before the download the Hub's checksum
   of every file is fetched and logged (sha256 for LFS files, git blob sha1 for
@@ -220,7 +248,8 @@ three tabs.
   resumes (files that are already complete are skipped). The same check runs
   for every cached model when the window opens ("startup check"), so a
   download interrupted by a crash or a closed window is flagged before
-  anything else happens.
+  anything else happens. That check does not take the download queue: a new
+  download can start while it is still reading the cache.
 - **Finish and move cached models**: the `hffinish` options as fields and
   check boxes (cache, library folder, filter, layout, merge, checksum, wait,
   ...). "Verify checksums" is on by default, so every file is hashed against
@@ -242,8 +271,8 @@ appends the following one, as often as you like. Every column (model, author,
 task, library, downloads last month, all-time downloads, likes, trending,
 updated, created, gated, tags) sorts by clicking its header, numbers and
 dates numerically. Several rows can be selected at once (Ctrl-click, Shift-click, Ctrl+A for the
-page): "Download" queues every selected model on the Download tab (asking
-first about the ones already downloaded), "Add to list" appends them all to
+page): "Download" queues every selected model on the Download tab (skipping
+the ones already downloaded), "Add to list" appends them all to
 the list there, "Open on huggingface.co" opens a tab for each. "View details"
 (or a double click) opens the model card window for the first selected one;
 while that window is open it follows the selection, switching to whichever
@@ -269,17 +298,18 @@ The **Downloaded** column says whether a listed model is already on this
 machine: "in library" (a folder with files in the library, in either
 layout), "in cache" (complete in the hub cache), "incomplete",
 "downloading" (another process is fetching it) or "unverified". It is
-checked on disk for every page and again after every job. Asking to download
-a model that is "in library" or "in cache", from any button or from a pasted
-list, brings up a pop-up that says so and asks whether you are sure; for a
-list you can also skip the ones already downloaded. The Task column is
+checked on disk for every page and again after every job. A model that is
+"in library" or "in cache" is never downloaded again from a list or a
+multi-selection: it is skipped and logged. Only the single Download button
+brings up a pop-up that says so and asks whether you are sure. The Task column is
 coloured by **category** (Multimodal, Text, Image, Video, Audio, Embeddings,
 Agents, Other, with a legend above the table), and the model card window
 shows the same colour. Every coloured cell is a solid box whose text is the
 box colour's opposite: the complementary hue, pale on a dark box and deep on
 a light one, so it reads clearly in both themes. The window itself carries
-the Hugging Face orange as accent on tabs, primary buttons, progress bars
-and table headers, on top of the system's light or dark theme.
+the Hugging Face orange as accent on tabs, progress bars and table headers,
+and green on every button (the main download buttons solid green, the others
+outlined; Stop buttons red), on top of the system's light or dark theme.
 
 **Libraries** tab: every model folder in the library (the destination), with
 state, an action button, file count, size, last change, details and path. The
@@ -324,7 +354,7 @@ What the launcher does the first time:
    a minute once; later runs start immediately.
 
 Downloads use the `hf.exe` already on PATH when there is one (so `hf_xet`
-and your login are picked up), otherwise huggingface_hub downloads in-process.
+and your login are picked up), otherwise a child process runs the download.
 
 To call it from anywhere, add the repo folder to PATH or create a shortcut to
 `hffinish.cmd`.
@@ -359,8 +389,8 @@ JRSoftware.InnoSetup`). It runs `build-exe.cmd` first, then compiles
 `installer.iss`:
 
 ```bat
-build-installer.cmd            :: dist\HF-Downloader-setup-1.2.0.exe
-build-installer.cmd 1.3.0      :: another version number
+build-installer.cmd            :: dist\HF-Downloader-setup-1.3.0.exe
+build-installer.cmd 1.3.1      :: another version number
 ```
 
 The installer puts `HF-Downloader.exe` (with its `_internal\` folder),
@@ -378,7 +408,7 @@ Open a **new** terminal after installing: terminals that were already open
 keep their old PATH and will not find `hffinish`. Silent install:
 
 ```bat
-HF-Downloader-setup-1.2.0.exe /VERYSILENT /NORESTART
+HF-Downloader-setup-1.3.0.exe /VERYSILENT /NORESTART
 ```
 
 The installer is unsigned, like the exe, so SmartScreen may warn once
