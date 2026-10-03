@@ -19,6 +19,7 @@ from hf_downloader import (  # noqa: E402
     parse_repo_list,
     parse_repo_ref,
     parse_size,
+    rate,
     restart_due,
     split_front_matter,
 )
@@ -179,6 +180,13 @@ def extra_checks() -> int:
     if parse_size("1.5", "GiB") != 1610612736 or parse_size("456", "kB") != 456000 or parse_size("0.00", "B") != 0:
         failures += 1
         print("FAIL parse_size")
+    # 50.47 MiB/s used to render as "50.5 MB/s (423 Mbit/s)": the byte side
+    # divided by 1024 while Mbit/s divided by 1e6. 50.5 × 8 is 404, not 423.
+    old_pair = 50.47 * 1024 * 1024
+    got_rate = rate(old_pair)
+    if hff.human(old_pair) != "50.5 MB" or got_rate != "52.9 MB/s (423 Mbit/s)" or rate(85_300_000) != "85.3 MB/s (682 Mbit/s)":
+        failures += 1
+        print(f"FAIL rate: {hff.human(old_pair)}/s beside bits became {got_rate!r}; docstring sample {rate(85_300_000)!r}")
     stub = _StubWorker()
     splitter = _LineSplitter(stub)
     decoder = __import__("codecs").getincrementaldecoder("utf-8")("replace")
@@ -241,7 +249,7 @@ def main() -> int:
         failures += 1
         print(f"FAIL {text!r}: accepted as {got!r}, should be rejected")
     failures += extra_checks()
-    total = len(CASES) + len(REJECTED) + 4 + len(PROGRESS_LINES) + 1 + len(NOT_PROGRESS) + 1 + 3 + 3
+    total = len(CASES) + len(REJECTED) + 4 + len(PROGRESS_LINES) + 1 + len(NOT_PROGRESS) + 2 + 3 + 3
     print(f"{total - failures}/{total} passed")
     return 1 if failures else 0
 

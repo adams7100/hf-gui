@@ -535,8 +535,24 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def _decimal_size(n: float) -> str:
+    """Bytes as B/KB/MB/GB/TB in steps of 1000.
+
+    File sizes use `hff.human`, which divides by 1024. A speed is shown next
+    to Mbit/s, and a megabit is always 1e6 bits, so the byte side has to use
+    the same steps. Dividing by 1024 paired 50.5 MiB/s with 423 Mbit/s
+    (50.5 × 8 is 404).
+    """
+    x = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if x < 1000 or unit == "TB":
+            return f"{x:.0f} {unit}" if unit == "B" else f"{x:.1f} {unit}"
+        x /= 1000
+    return f"{x:.1f} TB"
+
+
 def rate(bytes_per_s: float) -> str:
-    """'85.3 MB/s (682 Mbit/s)' for the progress panel."""
+    """'85.3 MB/s (682 Mbit/s)' for the progress panel. 85.3 × 8 = 682."""
     bits = bytes_per_s * 8
     if bits >= 1e9:
         bit_text = f"{bits / 1e9:.2f} Gbit/s"
@@ -544,7 +560,7 @@ def rate(bytes_per_s: float) -> str:
         bit_text = f"{bits / 1e6:.0f} Mbit/s"
     else:
         bit_text = f"{bits / 1e3:.0f} kbit/s"
-    return f"{hff.human(bytes_per_s)}/s ({bit_text})"
+    return f"{_decimal_size(bytes_per_s)}/s ({bit_text})"
 
 
 # --------------------------------------------------------------------------- the downloader's own counters
